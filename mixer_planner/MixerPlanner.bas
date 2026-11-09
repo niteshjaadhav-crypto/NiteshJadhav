@@ -58,6 +58,8 @@ Private Const S_DEFCO As Long = 18
 Private Const S_MAXCOMP As Long = 19
 Private Const S_LAST1 As Long = 20           ' 21 = MX02, 22 = MX03
 
+Private curPO(1 To 500) As String, curIt(1 To 500) As Long, nCur As Long
+
 Private Type PItem
     priRow As Long
     code22 As String
@@ -97,18 +99,19 @@ Public Sub Setup_Planner()
            "mixer cycle time per batch and the week start date.", vbInformation
 End Sub
 
-Private Function GetOrAddSheet(nm As String, Optional afterName As String = "") As Worksheet
-    On Error Resume Next
-    Set GetOrAddSheet = ThisWorkbook.Worksheets(nm)
-    On Error GoTo 0
-    If GetOrAddSheet Is Nothing Then
+Private Function GetOrAddSheet(nm As String, afterName As String) As Worksheet
+    Dim ws As Worksheet
+    If SheetExists(nm) Then
+        Set ws = ThisWorkbook.Worksheets(nm)
+    Else
         If afterName <> "" Then
-            Set GetOrAddSheet = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(afterName))
+            Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(afterName))
         Else
-            Set GetOrAddSheet = ThisWorkbook.Worksheets.Add(Before:=ThisWorkbook.Worksheets(1))
+            Set ws = ThisWorkbook.Worksheets.Add(Before:=ThisWorkbook.Worksheets(1))
         End If
-        GetOrAddSheet.Name = nm
+        ws.Name = nm
     End If
+    Set GetOrAddSheet = ws
 End Function
 
 Private Sub SetRow(ws As Worksheet, r As Long, lbl As String, defVal As Variant, note As String)
@@ -121,7 +124,7 @@ End Sub
 
 Private Sub BuildSettingsSheet()
     Dim ws As Worksheet
-    Set ws = GetOrAddSheet(SH_SET)
+    Set ws = GetOrAddSheet(SH_SET, "")
     ws.Range("A1").Value = "PLANNER SETTINGS  (edit yellow cells only)"
     ws.Range("A1").Font.Bold = True: ws.Range("A1").Font.Size = 14
     ws.Range("A2:C2").Value = Array("Setting", "Value", "Note")
@@ -206,6 +209,7 @@ Private Sub BuildPrioritySheet()
     ' status colours
     Dim rng As Range
     Set rng = ws.Range("M2:M61")
+    On Error Resume Next            ' colours are cosmetic - never stop setup for them
     rng.FormatConditions.Delete
     AddCF rng, "1-CRITICAL", RGB(248, 203, 173)
     AddCF rng, "2-WATCH", RGB(255, 230, 153)
@@ -217,6 +221,7 @@ Private Sub BuildPrioritySheet()
     ActiveWindow.FreezePanes = False
     ActiveWindow.FreezePanes = True
     If ws.AutoFilterMode = False Then ws.Range("A1:V61").AutoFilter
+    On Error GoTo 0
 End Sub
 
 Private Function WtFormula(s As String, codeCol As String, wCol As String, w2Col As String) As String
@@ -235,22 +240,23 @@ End Sub
 
 Private Sub BuildCOMapSheet()
     Dim ws As Worksheet, rec As Worksheet, r As Long, c As Variant, k As String
-    Dim nxt As Long, dict As Object
+    Dim nxt As Long, i As Long, seen As Boolean
     Set ws = GetOrAddSheet(SH_COMAP, SH_SET)
     ws.Range("A1:C1").Value = Array("21 Code (next compound)", "Compound", "Clean-out 29 code to use before it")
     ws.Range("A1:C1").Font.Bold = True
-    Set dict = CreateObject("Scripting.Dictionary")
     nxt = 2
     Do While Trim(CStr(ws.Cells(nxt, 1).Value)) <> ""
-        dict(CodeStr(ws.Cells(nxt, 1).Value)) = True
         nxt = nxt + 1
     Loop
     Set rec = ThisWorkbook.Worksheets(SH_RECIPE)
     For Each c In Array(2, 12, 21)
         For r = 3 To 80
             k = CodeStr(rec.Cells(r, c).Value)
-            If Left(k, 2) = "21" And Not dict.Exists(k) Then
-                dict(k) = True
+            seen = False
+            For i = 2 To nxt - 1
+                If CodeStr(ws.Cells(i, 1).Value) = k Then seen = True: Exit For
+            Next i
+            If Left(k, 2) = "21" And Not seen Then
                 ws.Cells(nxt, 1).NumberFormat = "@"
                 ws.Cells(nxt, 1).Value = k
                 ws.Cells(nxt, 2).Value = rec.Cells(r, c + 1).Value
@@ -267,7 +273,7 @@ End Sub
 
 Private Sub BuildIterationSheet()
     Dim ws As Worksheet
-    Set ws = GetOrAddSheet(SH_ITER, SH_COMAP)
+    Set ws = GetOrAddSheet(SH_ITER, SH_SET)
     ws.Range("A1:D1").Value = Array("PO number", "Last iteration used", "Updated on", "Source sheet")
     ws.Range("A1:D1").Font.Bold = True
     ws.Columns("A:D").ColumnWidth = 20
@@ -277,7 +283,7 @@ End Sub
 Private Sub BuildControlPanel()
     Dim ws As Worksheet, b As Object, i As Long
     Dim caps As Variant, macs As Variant, notes As Variant
-    Set ws = GetOrAddSheet(SH_PANEL)
+    Set ws = GetOrAddSheet(SH_PANEL, "")
     ws.Cells.Clear
     On Error Resume Next
     ws.Buttons.Delete
@@ -309,7 +315,7 @@ End Sub
 '==============================================================================
 Public Sub Build_Mixer_Plan()
     Dim wsP As Worksheet, r As Long, n As Long, i As Long, j As Long, m As Long
-    Dim it() As PItem, tmp As PItem
+    Dim it() As PItem, ord() As Long, tmpI As Long, gi As Long, jj As Long
     Dim cyc(1 To 3) As Double, load(1 To 3) As Double, ncomp(1 To 3) As Long
     Dim lastRun(1 To 3) As String
     Dim steps(1 To 3, 1 To 200) As PStep, nSteps(1 To 3) As Long
@@ -358,10 +364,15 @@ Public Sub Build_Mixer_Plan()
     If n = 0 Then MsgBox "Nothing to plan - no CRITICAL / WATCH compounds.", vbInformation: GoTo done
 
     '--- sort: lowest cover first, then highest consumption -------------------
+    '    (an index list is sorted - the records themselves never move)
+    ReDim ord(1 To n)
+    For i = 1 To n: ord(i) = i: Next i
     For i = 1 To n - 1
         For j = i + 1 To n
-            If it(j).cover < it(i).cover Or (it(j).cover = it(i).cover And it(j).req > it(i).req) Then
-                tmp = it(i): it(i) = it(j): it(j) = tmp
+            If it(ord(j)).cover < it(ord(i)).cover Or _
+               (it(ord(j)).cover = it(ord(i)).cover And it(ord(j)).req > it(ord(i)).req) Or _
+               (it(ord(j)).cover = it(ord(i)).cover And it(ord(j)).req = it(ord(i)).req And it(ord(j)).priRow < it(ord(i)).priRow) Then
+                tmpI = ord(i): ord(i) = ord(j): ord(j) = tmpI
             End If
         Next j
     Next i
@@ -370,24 +381,27 @@ Public Sub Build_Mixer_Plan()
     Dim g As Long, best As Long, bestKey As Double, needMin As Double, lc As Double
     Dim ok As Boolean, key As Double, avail As Double, mxB As Long, fitMx As Long, exFit As Long
     Dim ovr As Long
-    For g = 1 To n
+    For gi = 1 To n
+        g = ord(gi)
         If Not it(g).done Then
             ' override: first item in the group that has one
             ovr = 0
-            For j = g To n
+            For jj = gi To n
+                j = ord(jj)
                 If it(j).code21 = it(g).code21 And it(j).override > 0 Then ovr = it(j).override: Exit For
-            Next j
+            Next jj
             best = 0: bestKey = 1E+30
             For m = 1 To 3
                 ok = (ovr = 0 Or ovr = m) And ncomp(m) < maxComp
                 If ok Then
                     needMin = 0
-                    For j = g To n
+                    For jj = gi To n
+                        j = ord(jj)
                         If it(j).code21 = it(g).code21 Then
                             If it(j).wt(m) <= 0 Or it(j).pallet <= 0 Then ok = False: Exit For
                             needMin = needMin + MixBatches(it(j).exB, it(j).pallet, it(j).wt(m)) * cyc(m)
                         End If
-                    Next j
+                    Next jj
                 End If
                 If ok Then
                     lc = LCNeeded(nSteps(m), it(g).code21, lastRun(m), lcMin)
@@ -398,19 +412,21 @@ Public Sub Build_Mixer_Plan()
             Next m
 
             If best = 0 Then
-                For j = g To n
+                For jj = gi To n
+                    j = ord(jj)
                     If it(j).code21 = it(g).code21 Then
                         it(j).done = True
                         it(j).remark = "Not planned - no eligible mixer (check Recipe Details weights) or compound limit reached"
                     End If
-                Next j
+                Next jj
             Else
                 m = best
                 lc = LCNeeded(nSteps(m), it(g).code21, lastRun(m), lcMin)
                 If dayMin - load(m) - lc < cyc(m) Then
-                    For j = g To n
+                    For jj = gi To n
+                        j = ord(jj)
                         If it(j).code21 = it(g).code21 Then it(j).done = True: it(j).remark = "Not planned - mixer capacity full"
-                    Next j
+                    Next jj
                 Else
                     If lc > 0 Then
                         nSteps(m) = nSteps(m) + 1
@@ -419,7 +435,8 @@ Public Sub Build_Mixer_Plan()
                     End If
                     load(m) = load(m) + lc
                     ncomp(m) = ncomp(m) + 1
-                    For j = g To n
+                    For jj = gi To n
+                        j = ord(jj)
                         If it(j).code21 = it(g).code21 Then
                             it(j).done = True
                             mxB = MixBatches(it(j).exB, it(j).pallet, it(j).wt(m))
@@ -446,11 +463,11 @@ Public Sub Build_Mixer_Plan()
                                 steps(m, nSteps(m)).mxB = mxB
                             End If
                         End If
-                    Next j
+                    Next jj
                 End If
             End If
         End If
-    Next g
+    Next gi
 
     '--- write Priority results ------------------------------------------------
     For i = 1 To n
@@ -627,36 +644,45 @@ End Function
 '==============================================================================
 Public Sub Fill_PO_Numbers()
     Dim m As Long, ws As Worksheet, r As Long, c22 As String, kind As String
-    Dim mxPO As String, exPO As String, coPO As String, off As Long
-    Dim missing As Long, filled As Long
+    Dim mxPO As String, exPO As String, coPO As String, mxQty As Long, exQty As Long
+    Dim n As Long, fromIt As Long, toIt As Long
+    Dim missing As Long, filled As Long, over As Long
     Application.ScreenUpdating = False
+    nCur = 0
     For m = 1 To 3
         Set ws = ThisWorkbook.Worksheets("MX0" & m)
         For r = PLAN_FIRST To PLAN_LAST
             kind = CStr(ws.Cells(r, "BE").Value)
             c22 = CodeStr(ws.Range("D" & r).Value)
             If kind = "PROD" Then
-                FindPO m, c22, mxPO, exPO
+                FindPO m, c22, mxPO, mxQty, exPO, exQty
+                ' --- 21 code (mixer) PO ---
+                ws.Range("F" & r & ":H" & r).Interior.ColorIndex = xlNone
                 If mxPO <> "" Then
                     ws.Range("F" & r).Value = CDbl(mxPO)
-                    off = LastIteration(mxPO)
-                    If NumOf(ws.Cells(r, "BA").Value) > 0 Then
-                        ws.Range("G" & r).Value = off + ws.Cells(r, "BA").Value
-                        ws.Range("H" & r).Value = off + ws.Cells(r, "BB").Value
+                    n = CLng(NumOf(ws.Cells(r, "BB").Value) - NumOf(ws.Cells(r, "BA").Value) + 1)
+                    If NumOf(ws.Cells(r, "BA").Value) > 0 And n > 0 Then
+                        TakeIterations mxPO, n, fromIt, toIt      ' continues PO across rows and days
+                        ws.Range("G" & r).Value = fromIt
+                        ws.Range("H" & r).Value = toIt
+                        If mxQty > 0 And toIt > mxQty Then ws.Range("G" & r & ":H" & r).Interior.Color = RGB(255, 192, 0): over = over + 1
                     End If
-                    ws.Range("F" & r).Interior.ColorIndex = xlNone
                     filled = filled + 1
                 Else
                     ws.Range("F" & r).Interior.Color = RGB(255, 199, 206): missing = missing + 1
                 End If
+                ' --- 22 code (extruder) PO ---
+                ws.Range("J" & r & ":L" & r).Interior.ColorIndex = xlNone
                 If exPO <> "" Then
                     ws.Range("J" & r).Value = CDbl(exPO)
-                    off = LastIteration(exPO)
-                    If NumOf(ws.Cells(r, "BC").Value) > 0 Then
-                        ws.Range("K" & r).Value = off + ws.Cells(r, "BC").Value
-                        ws.Range("L" & r).Value = off + ws.Cells(r, "BD").Value
+                    n = CLng(NumOf(ws.Cells(r, "BD").Value) - NumOf(ws.Cells(r, "BC").Value) + 1)
+                    If NumOf(ws.Cells(r, "BC").Value) > 0 And n > 0 Then
+                        TakeIterations exPO, n, fromIt, toIt
+                        ws.Range("K" & r).Value = fromIt
+                        ws.Range("L" & r).Value = toIt
+                        If exQty > 0 And toIt > exQty Then ws.Range("K" & r & ":L" & r).Interior.Color = RGB(255, 192, 0): over = over + 1
                     End If
-                    ws.Range("J" & r).Interior.ColorIndex = xlNone
+                    filled = filled + 1
                 Else
                     ws.Range("J" & r).Interior.Color = RGB(255, 199, 206): missing = missing + 1
                 End If
@@ -672,14 +698,35 @@ Public Sub Fill_PO_Numbers()
         Next r
     Next m
     Application.ScreenUpdating = True
-    MsgBox filled & " PO cells filled." & IIf(missing > 0, vbLf & missing & " PO(s) not found - marked pink. Enter them in the PO / clean-out sheets and run again.", ""), _
-           IIf(missing > 0, vbExclamation, vbInformation)
+    MsgBox filled & " PO cells filled." & _
+           IIf(missing > 0, vbLf & missing & " PO(s) not found (pink). Enter them in the PO / clean-out sheets and run again.", "") & _
+           IIf(over > 0, vbLf & over & " row(s) need more batches than the PO has (orange). Release more or adjust.", ""), _
+           IIf(missing + over > 0, vbExclamation, vbInformation)
+End Sub
+
+' running "last iteration" per PO during one Fill run (starts from Iteration Log)
+Private Sub TakeIterations(po As String, n As Long, ByRef fromIt As Long, ByRef toIt As Long)
+    Dim i As Long
+    For i = 1 To nCur
+        If curPO(i) = po Then Exit For
+    Next i
+    If i > nCur Then
+        nCur = nCur + 1: i = nCur
+        curPO(i) = po
+        curIt(i) = LastIteration(po)
+    End If
+    fromIt = curIt(i) + 1
+    toIt = curIt(i) + n
+    curIt(i) = toIt
 End Sub
 
 ' latest PO lines for a 22 code in the mixer's PO sheet
-Private Sub FindPO(m As Long, c22 As String, ByRef mxPO As String, ByRef exPO As String)
+Private Sub FindPO(m As Long, c22 As String, ByRef mxPO As String, ByRef mxQty As Long, _
+                   ByRef exPO As String, ByRef exQty As Long)
+    ' latest OPEN PO for the 22 code: released batches > last iteration already used
     Dim ws As Worksheet, r As Long, firstRow As Long, colMX As Long, lastR As Long
-    mxPO = "": exPO = ""
+    Dim po As String, q As Long
+    mxPO = "": exPO = "": mxQty = 0: exQty = 0
     Select Case m
         Case 1: Set ws = ThisWorkbook.Worksheets("MX01 PO"): firstRow = 2: colMX = 8
         Case 2: Set ws = ThisWorkbook.Worksheets("MX02 PO "): firstRow = 2: colMX = 8
@@ -688,8 +735,16 @@ Private Sub FindPO(m As Long, c22 As String, ByRef mxPO As String, ByRef exPO As
     lastR = ws.Cells(ws.Rows.Count, 2).End(xlUp).Row
     For r = lastR To firstRow Step -1
         If CodeStr(ws.Cells(r, 2).Value) = c22 Then
-            If mxPO = "" And CodeStr(ws.Cells(r, colMX).Value) <> "" Then mxPO = CodeStr(ws.Cells(r, colMX).Value)
-            If exPO = "" And CodeStr(ws.Cells(r, 4).Value) <> "" Then exPO = CodeStr(ws.Cells(r, 4).Value)
+            po = CodeStr(ws.Cells(r, colMX).Value)
+            If mxPO = "" And po <> "" Then
+                q = CLng(NumOf(ws.Cells(r, colMX + 1).Value))
+                If q = 0 Or LastIteration(po) < q Then mxPO = po: mxQty = q
+            End If
+            po = CodeStr(ws.Cells(r, 4).Value)
+            If exPO = "" And po <> "" Then
+                q = CLng(NumOf(ws.Cells(r, 5).Value))
+                If q = 0 Or LastIteration(po) < q Then exPO = po: exQty = q
+            End If
             If mxPO <> "" And exPO <> "" Then Exit For
         End If
     Next r
@@ -722,44 +777,48 @@ End Function
 '==============================================================================
 Public Sub Build_Tote_Requirement()
     Dim ws As Worksheet, mxs As Worksheet, m As Long, r As Long, out As Long, s As String
-    Dim dict As Object, key As Variant, c22 As String, exN As Long, rank As Variant
+    Dim c22 As String, exN As Long, rank As Variant, i As Long, found As Boolean
+    Dim keyMx(1 To 100) As String, keyCode(1 To 100) As String, qty(1 To 100) As Long, nk As Long
     Set ws = ThisWorkbook.Worksheets(SH_TOTE)
-    Set dict = CreateObject("Scripting.Dictionary")
+    ' total planned EX batches per mixer + 22 code, in plan order
     For m = 1 To 3
         Set mxs = ThisWorkbook.Worksheets("MX0" & m)
         For r = PLAN_FIRST To PLAN_LAST
-            If mxs.Cells(r, "BE").Value = "PROD" And NumOf(mxs.Cells(r, "BD").Value) > 0 Then
+            If CStr(mxs.Cells(r, "BE").Value) = "PROD" And NumOf(mxs.Cells(r, "BD").Value) > 0 Then
                 c22 = CodeStr(mxs.Range("D" & r).Value)
-                exN = mxs.Cells(r, "BD").Value - mxs.Cells(r, "BC").Value + 1
-                key = "MX0" & m & "|" & c22
-                dict(key) = dict(key) + exN
+                exN = CLng(NumOf(mxs.Cells(r, "BD").Value) - NumOf(mxs.Cells(r, "BC").Value) + 1)
+                found = False
+                For i = 1 To nk
+                    If keyMx(i) = "MX0" & m And keyCode(i) = c22 Then qty(i) = qty(i) + exN: found = True: Exit For
+                Next i
+                If Not found And nk < 100 Then
+                    nk = nk + 1: keyMx(nk) = "MX0" & m: keyCode(nk) = c22: qty(nk) = exN
+                End If
             End If
         Next r
     Next m
-    ws.Range("B" & TOTE_FIRST & ":I" & TOTE_LAST).ClearContents
+    ws.Range("A" & TOTE_FIRST & ":I" & TOTE_LAST).ClearContents
     out = TOTE_FIRST
-    For Each key In dict.Keys
+    For i = 1 To nk
         If out > TOTE_LAST Then Exit For
         s = CStr(out)
-        c22 = Split(key, "|")(1)
-        ws.Range("A" & s).Value = out - TOTE_FIRST + 1
-        ws.Range("B" & s).Value = CDbl(c22)
-        ws.Range("D" & s).Value = Split(key, "|")(0)
-        ws.Range("E" & s).Value = dict(key)
-        rank = Application.Index(ThisWorkbook.Worksheets(SH_PRI).Range("A2:A61"), _
-               Application.Match(CDbl(c22), ThisWorkbook.Worksheets(SH_PRI).Range("B2:B61"), 0))
-        If Not IsError(rank) Then ws.Range("I" & s).Value = rank
+        ws.Range("A" & s).Value = i
+        ws.Range("B" & s).Value = CDbl(keyCode(i))
+        ws.Range("D" & s).Value = keyMx(i)
+        ws.Range("E" & s).Value = qty(i)
+        rank = Application.Match(CDbl(keyCode(i)), ThisWorkbook.Worksheets(SH_PRI).Range("B2:B61"), 0)
+        If Not IsError(rank) Then ws.Range("I" & s).Value = ThisWorkbook.Worksheets(SH_PRI).Range("A2:A61").Cells(rank, 1).Value
         out = out + 1
-    Next key
+    Next i
     ' internal Raw Data lookups (replaces the old link to an external file)
     For r = TOTE_FIRST To TOTE_LAST
         s = CStr(r)
         ws.Range("C" & s).Formula = "=IF(B" & s & "="""","""",IFERROR(INDEX('Raw Data'!$E$2:$E$400,MATCH(B" & s & ",'Raw Data'!$B$2:$B$400,0)),""""))"
         ws.Range("F" & s).Formula = "=IF(B" & s & "="""","""",IFERROR(INDEX('Raw Data'!$O$2:$O$400,MATCH(B" & s & ",'Raw Data'!$B$2:$B$400,0)),""""))"
         ws.Range("H" & s).Formula = "=IF(B" & s & "="""","""",IFERROR(INDEX('Raw Data'!$M$2:$M$400,MATCH(B" & s & ",'Raw Data'!$B$2:$B$400,0)),""""))"
-        ws.Range("G" & s).Formula = "=IFERROR(E" & s & "*H" & s & ","""")"
+        ws.Range("G" & s).Formula = "=IF(B" & s & "="""","""",IFERROR(E" & s & "*H" & s & ",""""))"
     Next r
-    MsgBox "Tote requirement updated (" & dict.Count & " line(s)).", vbInformation
+    MsgBox "Tote requirement updated (" & nk & " line(s)).", vbInformation
 End Sub
 
 '==============================================================================
@@ -813,6 +872,7 @@ End Sub
 
 Private Function FindPORow(ws As Worksheet, po As String) As Range
     Dim r As Long
+    Set FindPORow = Nothing
     For r = 2 To ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
         If CodeStr(ws.Cells(r, 1).Value) = po Then Set FindPORow = ws.Cells(r, 1): Exit Function
     Next r
@@ -874,8 +934,8 @@ Private Function LastRunning21(m As Long) As String
 End Function
 
 Private Function SheetExists(nm As String) As Boolean
-    Dim ws As Worksheet
-    On Error Resume Next
-    Set ws = ThisWorkbook.Worksheets(nm)
-    SheetExists = Not ws Is Nothing
+    Dim sh As Object
+    For Each sh In ThisWorkbook.Worksheets
+        If sh.Name = nm Then SheetExists = True: Exit Function
+    Next sh
 End Function

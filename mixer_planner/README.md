@@ -64,12 +64,23 @@ the workbook's own `Raw Data`.
 3. **Control Panel → 1. Build Mixer Plan**. MX01, MX02 and MX03 are filled.
 4. Release the 21/22/29 POs in SAP and enter them in MX01 PO / MX02 PO / MX03 PO and the clean-out sheets
    (as today).
-5. **2. Fill PO Numbers**. PO numbers and iteration from/to appear. Pink cells mean the PO was not found.
+5. **2. Fill PO Numbers**. PO numbers and iteration from/to appear.
+   * It takes the latest **open** PO for each 22 code, meaning a PO whose released batches are more than the
+     iterations already used.
+   * Iterations continue across shift-split rows, across 22 codes that share one 21-code PO, and across days.
+   * Pink = PO not found. Orange = the plan needs more batches than the PO has.
 6. **3. Build Tote Requirement**.
 7. At end of day: **4. Close Day**. It stores the iterations so tomorrow continues correctly.
    (Building tomorrow's plan also does this automatically for the old plan.)
 
 **Thursday:** update STOCK D/H/K from the planning email image and set *Week start date* in Planner Settings.
+
+## Tested
+
+* The VBA was executed end to end (Setup → Build → Fill PO → Tote → Close Day) on a copy of the real workbook.
+  Its mixer allocation matched the Python dry-run exactly: MX01 1304, MX02 1438 and MX03 938 planned
+  minutes, with the same mixer for every compound.
+* The test ran in LibreOffice, not Excel. Run it once on a **copy** in Excel before using it live.
 
 ## Files
 

@@ -184,7 +184,7 @@ def mixer_batches(ex, pallet, wt):
 # ---------------- mixer allocation + sequencing ------------------------------
 def allocate(items):
     # most urgent first; on equal cover the compound consumed fastest goes first
-    need = sorted([i for i in items if i["plan_ex"] > 0], key=lambda i: (i["cover"], -i["req"]))
+    need = sorted([i for i in items if i["plan_ex"] > 0], key=lambda i: (i["cover"], -i["req"], i["row"]))
     groups, seen = [], set()
     for i in need:                         # group 22 codes by 21 code (no LC between them)
         if i["c21"] in seen:
@@ -333,9 +333,28 @@ def write_output(items, seq, path):
     wb.save(path)
 
 
+def last_running(read, rawd, plan_serial):
+    """21 code of the last compound on each MX sheet, if that plan is older than today."""
+    for m in (1, 2, 3):
+        if S["last_running"][m]:
+            continue
+        c = read(f"MX0{m}", 140)
+        d = num(c.get((4, 1)))
+        if not d or d >= plan_serial:
+            continue
+        for r in range(140, 3, -1):
+            c22 = code(c.get((r, 4)))
+            if c22.startswith("22") and len(c22) == 8:
+                S["last_running"][m] = rawd.get(c22, {}).get("c21", "")
+                break
+
+
 def main(src, out):
+    import datetime
     read = read_workbook(src)
     rawd, wts = load_master(read)
+    last_running(read, rawd, (datetime.date.today() - datetime.date(1899, 12, 30)).days)
+    print("last running 21 code per mixer:", S["last_running"])
     items = build_priority(read, rawd, wts)
     seq, load = allocate(items)
     write_output(items, seq, out)
