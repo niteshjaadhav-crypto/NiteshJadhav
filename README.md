@@ -16,7 +16,7 @@ What it does:
 ## Setup
 
 ```bash
-pip install -r requirements.txt     # yt-dlp + faster-whisper
+pip install -r requirements.txt     # yt-dlp + faster-whisper (needs Python 3.10–3.13; on Windows: py -3.12 -m pip install -r requirements.txt)
 # plus ffmpeg:  sudo apt install ffmpeg   |   brew install ffmpeg   |   winget install ffmpeg
 ```
 

@@ -10,18 +10,23 @@ Turn the video at this link into a reusable Claude skill: **$ARGUMENTS**
 The first argument is the video URL (YouTube, Instagram, etc. — anything yt-dlp supports).
 The optional second argument is the skill name. If it is missing, the script names the skill after the video title.
 
-## Step 1 — Make sure the tools are installed
+## Step 1 — Find the right Python and make sure the tools are installed
 
-```bash
-python3 -c "import faster_whisper" 2>/dev/null && command -v yt-dlp >/dev/null || pip install -q yt-dlp faster-whisper
-```
+faster-whisper needs Python 3.10–3.13 (newer versions such as 3.15 cannot install it yet).
+Pick the first command below that prints `OK`, and use it as `PY` for the rest of this command:
+
+- Windows: `py -3.12 -c "import faster_whisper; print('OK')"` (also try `py -3.13`, `py -3.11`)
+- Mac/Linux: `python3 -c "import faster_whisper; print('OK')"`
+
+If none prints `OK`, run `<PY> -m pip install yt-dlp faster-whisper` with a Python 3.10–3.13. If no such Python exists,
+tell the user to install Python 3.12 and stop.
 
 `ffmpeg` must also be available. If it is missing, tell the user and stop.
 
 ## Step 2 — Download, grab frames, transcribe, delete the video
 
 ```bash
-python3 scripts/video_to_skill.py $ARGUMENTS
+<PY> scripts/video_to_skill.py $ARGUMENTS
 ```
 
 The script:
