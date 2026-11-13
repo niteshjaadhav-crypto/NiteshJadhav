@@ -121,6 +121,31 @@ Last iteration closed (till yesterday) · Today's plan: from · to · **Last ite
 All four additions were tested end to end in LibreOffice on a copy of your workbook. The Python dry-run still
 covers only the core planning rules (no manual quantities or mixer availability).
 
+## Version 3 additions
+
+### Priority sheet
+* **Rank, 22 Code and Material (columns A–C) are frozen**, so you can always see which compound you are
+  editing while working in the manual columns on the right.
+* **Column Z – MANUAL priority**: type 1 to plan a compound first, 2 for second, and so on. Blank = automatic order.
+  A manual number goes just before the automatic rank with the same number. For example, typing 3 places the
+  compound before the item that is automatically ranked 3. Compounds with the same 21 code still run together
+  (no extra line clearance).
+* **Column AA – Plan sequence**: the final order the planner used, written by Build Mixer Plan.
+* **Column AB – No. of POs to release**: more than 1 when the SAP limit forces a split.
+
+### SAP iteration limit (Planner Settings rows 24–25)
+* **Max iterations per 21 code PO = 99** (SAP limit). **Max EX batches per 22 code PO = 30**.
+* A bigger plan is **split into several POs automatically**. Each split keeps the mixer batches ≤ 99 and the EX batches ≤ 30.
+  Example: FM157/1 765, 42 EX batches → PO 1: 30 EX / 84 mixer, PO 2: 12 EX / 34 mixer.
+* MX01/02/03 column **N** shows "PO 1 of 2" / "PO 2 of 2". Iterations restart at 1 for each new PO.
+* New sheet **PO Release List**: exactly what to release in SAP today (mixer, sequence, 22 code, 21 code,
+  PO split, 22 code PO qty, 21 code PO qty). It also lists any open POs already released for that 22 code
+  that still have batches left, so you can use those first.
+* **Fill PO Numbers** gives each row the oldest released PO that still has room. Room = PO quantity, never more
+  than 99 / 30, minus the iterations already used. Rows that would go beyond the SAP limit turn **RED**.
+* Only POs released from 7 days before the week start, or already running in the Iteration Log, are used.
+  This stops very old POs from being picked up.
+
 ## Tested
 
 * The VBA was executed end to end (Setup → Build → Fill PO → Tote → Close Day) on a copy of the real workbook.

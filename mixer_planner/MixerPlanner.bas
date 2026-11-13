@@ -64,6 +64,9 @@ Private Const S_DEFCO As Long = 18
 Private Const S_MAXCOMP As Long = 19
 Private Const S_LAST1 As Long = 20           ' 21 = MX02, 22 = MX03
 Private Const S_WEEKNO As Long = 23
+Private Const S_MAXMX As Long = 24           ' SAP: max iterations of one 21 code (mixer) PO
+Private Const S_MAXEX As Long = 25           ' max EX batches (iterations) of one 22 code PO
+Private Const SH_REL As String = "PO Release List"
 ' mixer availability table on Planner Settings: E2 header, rows 3..9 = Monday..Sunday, F/G/H = MX01/MX02/MX03
 Private Const AV_FIRST As Long = 3
 Private Const AV_COL As Long = 6
@@ -73,6 +76,7 @@ Private Const IL_PO As Long = 1, IL_TYPE As Long = 2, IL_CODE As Long = 3, IL_MA
 Private Const IL_DATE As Long = 6, IL_QTY As Long = 7, IL_CLOSED As Long = 8, IL_TFROM As Long = 9, IL_TTO As Long = 10
 Private Const IL_LAST As Long = 11, IL_REM As Long = 12, IL_STAT As Long = 13, IL_UPD As Long = 14
 
+Private gMaxMx As Long, gMaxEx As Long
 Private curPO(1 To 500) As String, curIt(1 To 500) As Long, curBase(1 To 500) As Long, curMix(1 To 500) As String, nCur As Long
 
 Private Type PItem
@@ -169,6 +173,8 @@ Private Sub BuildSettingsSheet()
     SetRow ws, S_LAST1 + 1, "MX02 compound (21 code) running at end of yesterday", "", ""
     SetRow ws, S_LAST1 + 2, "MX03 compound (21 code) running at end of yesterday", "", ""
     SetRow ws, S_WEEKNO, "Week number (as per planning team)", DatePart("ww", thu, vbMonday, vbFirstFourDays), "Written into 'Limited Batch Log' by Start New Week"
+    SetRow ws, S_MAXMX, "SAP max iterations per 21 code (mixer) PO", 99, "SAP does not allow a mixer PO beyond this iteration"
+    SetRow ws, S_MAXEX, "Max EX batches per 22 code PO", 30, "About 99 / 3. Bigger plans are split into several POs automatically"
     ' --- mixer availability per weekday ---
     Dim d As Long, m As Long
     ws.Range("E2").Value = "MIXER AVAILABILITY (shifts: 3 / 2 / 1 / OFF)"
@@ -207,13 +213,14 @@ Private Sub BuildPrioritySheet()
     Dim ws As Worksheet, r As Long, s As String, sp As String
     Set ws = GetOrAddSheet(SH_PRI, SH_STOCK)
     sp = "'" & SH_SET & "'!$B$"
-    ws.Range("A1:Y1").Value = Array("Rank", "22 Code", "Material", "21 Code", "Compound", "Colour", _
+    ws.Range("A1:AB1").Value = Array("Rank", "22 Code", "Material", "21 Code", "Compound", "Colour", _
         "Stock (EX batches)", "EX batches req / day", "Days cover", "Weekly limit (STOCK K)", _
         "Released this week", "Limit left", "Status", "Plan EX batches", "Pallet kg", _
         "MX01 batch wt", "MX02 batch wt", "MX03 batch wt", "Mixer override (type MX01/MX02/MX03)", _
         "Assigned mixer", "Mixer batches", "Remark", _
         "MANUAL plan EX batches (blank = auto, 0 = do not plan)", "Reason for change (RM / tote / pallet shortage...)", _
-        "FINAL plan EX batches")
+        "FINAL plan EX batches", "MANUAL priority (1 = plan first, blank = auto)", "Plan sequence (after Build)", _
+        "No. of POs to release (SAP limit split)")
     For r = PRI_FIRST To PRI_LAST
         s = CStr(r)
         ws.Range("B" & s).Formula = "=IF(TRIM(STOCK!D" & s & "&"""")="""","""",STOCK!D" & s & ")"
@@ -245,15 +252,17 @@ Private Sub BuildPrioritySheet()
     ws.Range("O2:R61").NumberFormat = "0.0"
     ws.Range("S2:S61").Interior.Color = RGB(255, 255, 0)
     ws.Range("W2:X61").Interior.Color = RGB(255, 255, 0)
+    ws.Range("Z2:Z61").Interior.Color = RGB(255, 255, 0)
+    ws.Range("Z2:Z61").Font.Color = RGB(0, 0, 255)
     ws.Range("W2:W61").Font.Color = RGB(0, 0, 255)
     ws.Range("Y2:Y61").Font.Bold = True
-    With ws.Range("A1:Y1")
+    With ws.Range("A1:AB1")
         .Font.Bold = True: .Font.Color = RGB(255, 255, 255)
         .Interior.Color = RGB(31, 78, 120): .WrapText = True
     End With
     ws.Rows(1).RowHeight = 45
     ws.Cells.Font.Name = "Arial"
-    ws.Columns("A:Y").ColumnWidth = 11
+    ws.Columns("A:AB").ColumnWidth = 11
     ws.Columns("C").ColumnWidth = 22: ws.Columns("V").ColumnWidth = 40
     ws.Columns("W").ColumnWidth = 18: ws.Columns("X").ColumnWidth = 34
     ' status colours
@@ -267,11 +276,12 @@ Private Sub BuildPrioritySheet()
     AddCF rng, "CHECK DATA", RGB(189, 215, 238)
     AddCF rng, "LIMIT DONE", RGB(217, 217, 217)
     ws.Activate
-    ws.Range("A2").Select
+    ActiveWindow.FreezePanes = False
+    ws.Range("D2").Select                 ' Rank, 22 Code and Material stay visible when scrolling right
     ActiveWindow.FreezePanes = False
     ActiveWindow.FreezePanes = True
     If ws.AutoFilterMode Then ws.AutoFilterMode = False
-    ws.Range("A1:Y61").AutoFilter
+    ws.Range("A1:AB61").AutoFilter
     ' STOCK: compound turns green when its weekly limited quantity is finished
     Set rng = ThisWorkbook.Worksheets(SH_STOCK).Range("F2:F61")
     rng.FormatConditions.Add(Type:=xlExpression, Formula1:="=Priority!$M2=""LIMIT DONE""").Interior.Color = RGB(146, 208, 80)
@@ -524,6 +534,8 @@ Public Sub Build_Mixer_Plan()
     ReDim it(1 To PRI_LAST)
     n = 0
     wsP.Range("T2:V" & PRI_LAST).ClearContents
+    wsP.Range("AA2:AB" & PRI_LAST).ClearContents
+    LoadLimits
     For r = PRI_FIRST To PRI_LAST
         If IsNumeric(wsP.Cells(r, "Y").Value) And CodeStr(wsP.Cells(r, "B").Value) <> "" Then
             If CDbl(wsP.Cells(r, "Y").Value) > 0 Then
@@ -561,6 +573,25 @@ Public Sub Build_Mixer_Plan()
             End If
         Next j
     Next i
+    '--- your manual priority (Priority col Z) overrides the automatic order ---
+    '    key = manual number - 0.5 (so "3" goes just before automatic rank 3), else automatic position
+    Dim pkey() As Double, tmpD As Double, mp As Double
+    ReDim pkey(1 To n)
+    For i = 1 To n
+        mp = NumOf(wsP.Cells(it(ord(i)).priRow, "Z").Value)
+        If mp > 0 Then pkey(i) = mp - 0.5 Else pkey(i) = i
+    Next i
+    For i = 2 To n                       ' stable insertion sort on pkey
+        tmpD = pkey(i): tmpI = ord(i): j = i - 1
+        Do While j >= 1
+            If pkey(j) <= tmpD Then Exit Do
+            pkey(j + 1) = pkey(j): ord(j + 1) = ord(j): j = j - 1
+        Loop
+        pkey(j + 1) = tmpD: ord(j + 1) = tmpI
+    Next i
+    For i = 1 To n
+        wsP.Cells(it(ord(i)).priRow, "AA").Value = i
+    Next i
 
     '--- allocate groups (same 21 code = no LC between them) -------------------
     Dim g As Long, best As Long, bestKey As Double, needMin As Double, lc As Double
@@ -584,7 +615,7 @@ Public Sub Build_Mixer_Plan()
                         j = ord(jj)
                         If it(j).code21 = it(g).code21 Then
                             If it(j).wt(m) <= 0 Or it(j).pallet <= 0 Then ok = False: Exit For
-                            needMin = needMin + MixBatches(it(j).exB, it(j).pallet, it(j).wt(m)) * cyc(m)
+                            needMin = needMin + MixBatchesChunked(it(j).exB, it(j).pallet, it(j).wt(m)) * cyc(m)
                         End If
                     Next jj
                 End If
@@ -624,18 +655,22 @@ Public Sub Build_Mixer_Plan()
                         j = ord(jj)
                         If it(j).code21 = it(g).code21 Then
                             it(j).done = True
-                            mxB = MixBatches(it(j).exB, it(j).pallet, it(j).wt(m))
+                            mxB = MixBatchesChunked(it(j).exB, it(j).pallet, it(j).wt(m))
                             avail = dm(m) - load(m)
                             If mxB * cyc(m) > avail Then
                                 fitMx = Int(avail / cyc(m))
                                 exFit = Int(fitMx * it(j).wt(m) / it(j).pallet)
+                                Do While exFit > 0
+                                    If MixBatchesChunked(exFit, it(j).pallet, it(j).wt(m)) * cyc(m) <= avail Then Exit Do
+                                    exFit = exFit - 1
+                                Loop
                                 If exFit < 1 Then
                                     it(j).remark = "Not planned - mixer capacity full"
                                     mxB = 0
                                 Else
                                     it(j).remark = "Partial: " & exFit & " of " & it(j).exB & " EX batches (capacity)"
                                     it(j).exB = exFit
-                                    mxB = MixBatches(exFit, it(j).pallet, it(j).wt(m))
+                                    mxB = MixBatchesChunked(exFit, it(j).pallet, it(j).wt(m))
                                 End If
                             End If
                             If mxB > 0 Then
@@ -660,6 +695,7 @@ Public Sub Build_Mixer_Plan()
             If .mixer > 0 Then
                 wsP.Cells(.priRow, "T").Value = "MX0" & .mixer
                 wsP.Cells(.priRow, "U").Value = .mxB
+                wsP.Cells(.priRow, "AB").Value = -Int(-.exB / ChunkEx(.pallet, .wt(.mixer)))
             End If
             If .manual Then
                 wsP.Cells(.priRow, "V").Value = Trim("MANUAL qty" & IIf(Trim(CStr(wsP.Cells(.priRow, "X").Value)) <> "", " (" & wsP.Cells(.priRow, "X").Value & ")", "") & ". " & .remark)
@@ -669,6 +705,7 @@ Public Sub Build_Mixer_Plan()
         End With
     Next i
 
+    WriteReleaseList it, steps, nSteps
     '--- write the three mixer sheets ------------------------------------------
     Dim summary As String
     For m = 1 To 3
@@ -706,6 +743,103 @@ Private Function MixBatches(exB As Long, pallet As Double, wt As Double) As Long
     If x - MixBatches > 0.000001 Then MixBatches = MixBatches + 1
 End Function
 
+Private Sub LoadLimits()
+    gMaxMx = CLng(GetNum(S_MAXMX)): If gMaxMx <= 0 Then gMaxMx = 99
+    gMaxEx = CLng(GetNum(S_MAXEX)): If gMaxEx <= 0 Then gMaxEx = 30
+End Sub
+
+' EX batches per SAP PO: at most gMaxEx, and its mixer batches must stay <= gMaxMx
+Private Function ChunkEx(pallet As Double, wt As Double) As Long
+    Dim c As Long
+    If gMaxEx <= 0 Then LoadLimits
+    c = gMaxEx
+    If pallet > 0 And wt > 0 Then
+        Do While c > 1
+            If MixBatches(c, pallet, wt) <= gMaxMx Then Exit Do
+            c = c - 1
+        Loop
+    End If
+    ChunkEx = c
+End Function
+
+' mixer batches when the plan is split into several POs (each PO rounds up on its own)
+Private Function MixBatchesChunked(exB As Long, pallet As Double, wt As Double) As Long
+    Dim ce As Long, full As Long, rest As Long
+    ce = ChunkEx(pallet, wt)
+    full = exB \ ce
+    rest = exB - full * ce
+    MixBatchesChunked = full * MixBatches(ce, pallet, wt)
+    If rest > 0 Then MixBatchesChunked = MixBatchesChunked + MixBatches(rest, pallet, wt)
+End Function
+
+' what to release in SAP today: one line per PO, already split to the SAP limits
+Private Sub WriteReleaseList(it() As PItem, steps() As PStep, nSteps() As Long)
+    Dim ws As Worksheet, m As Long, s As Long, idx As Long, r As Long, k As Long, nCh As Long
+    Dim ce As Long, cex As Long, exLeft As Long, seq As Long
+    If Not SheetExists(SH_REL) Then GetOrAddSheet SH_REL, SH_PRI
+    Set ws = ThisWorkbook.Worksheets(SH_REL)
+    ws.Cells.ClearContents
+    ws.Range("A1").Value = "PO RELEASE LIST for " & Format(Cfg(S_PLANDATE), "dd-mmm-yyyy") & _
+        "   (SAP limits: " & gMaxMx & " iterations per 21 code PO, " & gMaxEx & " per 22 code PO)"
+    ws.Range("A1").Font.Bold = True
+    ws.Range("A2:I2").Value = Array("Mixer", "Sequence", "22 Code", "Material", "21 Code", "PO split", _
+        "22 code PO qty (EX batches)", "21 code PO qty (mixer batches)", "Open POs already released (use these first)")
+    With ws.Range("A2:I2")
+        .Font.Bold = True: .WrapText = True
+        .Font.Color = RGB(255, 255, 255): .Interior.Color = RGB(31, 78, 120)
+    End With
+    r = 3
+    For m = 1 To 3
+        seq = 0
+        For s = 1 To nSteps(m)
+            If steps(m, s).kind = "PROD" Then
+                idx = steps(m, s).item
+                seq = seq + 1
+                ce = ChunkEx(it(idx).pallet, it(idx).wt(m))
+                exLeft = it(idx).exB
+                nCh = -Int(-exLeft / ce): k = 0
+                Do While exLeft > 0
+                    k = k + 1
+                    If exLeft < ce Then cex = exLeft Else cex = ce
+                    exLeft = exLeft - cex
+                    ws.Cells(r, 1).Value = "MX0" & m
+                    ws.Cells(r, 2).Value = seq
+                    ws.Cells(r, 3).Value = CDbl(it(idx).code22)
+                    ws.Cells(r, 4).Value = it(idx).mat
+                    If IsNumeric(it(idx).code21) And it(idx).code21 <> "" Then ws.Cells(r, 5).Value = CDbl(it(idx).code21)
+                    ws.Cells(r, 6).Value = k & " of " & nCh
+                    ws.Cells(r, 7).Value = cex
+                    ws.Cells(r, 8).Value = MixBatches(cex, it(idx).pallet, it(idx).wt(m))
+                    If k = 1 Then ws.Cells(r, 9).Value = OpenPOText(it(idx).code22)
+                    r = r + 1
+                Loop
+            End If
+        Next s
+    Next m
+    ws.Columns("A:H").ColumnWidth = 13
+    ws.Columns("D").ColumnWidth = 24
+    ws.Columns("I").ColumnWidth = 60
+    ws.Rows(2).RowHeight = 45
+    ws.Cells.Font.Name = "Arial"
+End Sub
+
+' open 22 code POs of this code in the Iteration Log that still have batches left
+Private Function OpenPOText(c22 As String) As String
+    Dim ws As Worksheet, r As Long, lastR As Long, remB As Double, t As String
+    If Not SheetExists(SH_ITER) Then Exit Function
+    Set ws = ThisWorkbook.Worksheets(SH_ITER)
+    lastR = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For r = 2 To lastR
+        If CodeStr(ws.Cells(r, IL_CODE).Value) = c22 And CStr(ws.Cells(r, IL_TYPE).Value) = "22 code (extruder)" Then
+            If NumOf(ws.Cells(r, IL_QTY).Value) > 0 Then
+                remB = NumOf(ws.Cells(r, IL_QTY).Value) - NumOf(ws.Cells(r, IL_CLOSED).Value)
+                If remB > 0 Then t = t & IIf(t = "", "", ", ") & CodeStr(ws.Cells(r, IL_PO).Value) & ": " & remB & " left"
+            End If
+        End If
+    Next r
+    OpenPOText = t
+End Function
+
 Private Sub WriteMixerSheet(m As Long, it() As PItem, steps() As PStep, ns As Long, cyc As Double)
     ' steps is (mixer, step) - this sub only reads row m
     Dim ws As Worksheet, r As Long, t As Double, sr As Long, s As Long, k As Long
@@ -713,6 +847,7 @@ Private Sub WriteMixerSheet(m As Long, it() As PItem, steps() As PStep, ns As Lo
     Dim planDate As Variant, co As String, idx As Long
     Dim n As Long, rel As Long, leftB As Long, take As Long, fit As Long, sIdx As Long
     Dim exPrev As Long, exTo As Long, toB As Long
+    Dim ce As Long, cex As Long, exLeft As Long, nCh As Long, poTag As String
 
     Set ws = ThisWorkbook.Worksheets("MX0" & m)
     ' log yesterday's iterations automatically before clearing an older plan
@@ -746,7 +881,15 @@ Private Sub WriteMixerSheet(m As Long, it() As PItem, steps() As PStep, ns As Lo
             Next k
         Else
             idx = steps(m, s).item
-            n = steps(m, s).mxB
+            ce = ChunkEx(it(idx).pallet, it(idx).wt(m))
+            exLeft = it(idx).exB
+            nCh = -Int(-exLeft / ce): k = 0
+          Do While exLeft > 0                       ' one chunk = one SAP PO (max 99 mixer / 30 EX iterations)
+            k = k + 1
+            If exLeft < ce Then cex = exLeft Else cex = ce
+            exLeft = exLeft - cex
+            If nCh > 1 Then poTag = "PO " & k & " of " & nCh Else poTag = ""
+            n = MixBatches(cex, it(idx).pallet, it(idx).wt(m))
             rel = 1: leftB = n: exPrev = 0
             Do While leftB > 0
                 sIdx = Int(t / shiftLen + 0.000001)
@@ -763,17 +906,20 @@ Private Sub WriteMixerSheet(m As Long, it() As PItem, steps() As PStep, ns As Lo
                 End If
                 If take > 0 Then
                     toB = rel + take - 1
-                    If toB = n Then exTo = it(idx).exB Else exTo = Int(toB * it(idx).exB / n)
+                    If toB = n Then exTo = cex Else exTo = Int(toB * cex / n)
                     If exTo > exPrev Then
                         WriteRow ws, r, planDate, ShiftOf(t, shiftLen), sr, it(idx).code22, rel, toB, exPrev + 1, exTo, False
                         exPrev = exTo
                     Else
                         WriteRow ws, r, planDate, ShiftOf(t, shiftLen), sr, it(idx).code22, rel, toB, 0, 0, False
                     End If
+                    ws.Range("N" & r).Value = poTag
+                    ws.Cells(r, "BF").Value = k
                     r = r + 1: sr = sr + 1
                     t = t + take * cyc: rel = toB + 1: leftB = leftB - take
                 End If
             Loop
+          Loop
         End If
         If r > PLAN_LAST Then Exit For
     Next s
@@ -791,9 +937,11 @@ Private Sub ClearPlan(ws As Worksheet)
     ws.Range("F" & PLAN_FIRST & ":H" & PLAN_LAST).ClearContents
     ws.Range("J" & PLAN_FIRST & ":L" & PLAN_LAST).ClearContents
     ws.Range("F" & PLAN_FIRST & ":L" & PLAN_LAST).Interior.ColorIndex = xlNone
-    ws.Range(HELP_COL & PLAN_FIRST & ":BE" & PLAN_LAST).ClearContents
-    ws.Range(HELP_COL & "3:BE3").Value = Array("Plan 21 rel from", "Plan 21 rel to", "Plan 22 rel from", "Plan 22 rel to", "Row type")
-    ws.Columns(HELP_COL & ":BE").Hidden = True
+    ws.Range("N" & PLAN_FIRST & ":N" & PLAN_LAST).ClearContents
+    If Trim(CStr(ws.Range("N3").Value)) = "" Or Left(CStr(ws.Range("N3").Value), 8) = "PO split" Then ws.Range("N3").Value = "PO split (SAP limit)"
+    ws.Range(HELP_COL & PLAN_FIRST & ":BF" & PLAN_LAST).ClearContents
+    ws.Range(HELP_COL & "3:BF3").Value = Array("Plan 21 rel from", "Plan 21 rel to", "Plan 22 rel from", "Plan 22 rel to", "Row type", "PO chunk")
+    ws.Columns(HELP_COL & ":BF").Hidden = True
 End Sub
 
 Private Sub WriteRow(ws As Worksheet, r As Long, d As Variant, sh As String, sr As Long, code As String, _
@@ -844,30 +992,37 @@ End Function
 '==============================================================================
 Public Sub Fill_PO_Numbers()
     Dim m As Long, ws As Worksheet, r As Long, c22 As String, kind As String
-    Dim mxPO As String, exPO As String, coPO As String, mxQty As Long, exQty As Long
-    Dim n As Long, fromIt As Long, toIt As Long
-    Dim missing As Long, filled As Long, over As Long
+    Dim mxPO As String, exPO As String, coPO As String, mxCap As Long, exCap As Long
+    Dim n As Long, nn As Long, fromIt As Long, toIt As Long, fits As Boolean
+    Dim missing As Long, filled As Long, over As Long, sapLim As Long
+    Dim prevCode As String, prevEx As String, prevExCap As Long
     Application.ScreenUpdating = False
+    LoadLimits
     SyncPOLog                       ' newly released POs -> Iteration Log
     ClearTodayIterations
     nCur = 0
     For m = 1 To 3
         Set ws = ThisWorkbook.Worksheets("MX0" & m)
+        prevCode = "": prevEx = ""
         For r = PLAN_FIRST To PLAN_LAST
             kind = CStr(ws.Cells(r, "BE").Value)
             c22 = CodeStr(ws.Range("D" & r).Value)
             If kind = "PROD" Then
-                FindPO m, c22, mxPO, mxQty, exPO, exQty
-                ' --- 21 code (mixer) PO ---
+                ' --- 21 code (mixer) PO: first released PO that still has room for this row ---
                 ws.Range("F" & r & ":H" & r).Interior.ColorIndex = xlNone
+                n = CLng(NumOf(ws.Cells(r, "BB").Value) - NumOf(ws.Cells(r, "BA").Value) + 1)
+                mxPO = PickPO(m, c22, True, n, mxCap, fits)
                 If mxPO <> "" Then
                     ws.Range("F" & r).Value = CDbl(mxPO)
-                    n = CLng(NumOf(ws.Cells(r, "BB").Value) - NumOf(ws.Cells(r, "BA").Value) + 1)
                     If NumOf(ws.Cells(r, "BA").Value) > 0 And n > 0 Then
                         TakeIterations mxPO, n, fromIt, toIt, "MX0" & m   ' continues PO across rows and days
                         ws.Range("G" & r).Value = fromIt
                         ws.Range("H" & r).Value = toIt
-                        If mxQty > 0 And toIt > mxQty Then ws.Range("G" & r & ":H" & r).Interior.Color = RGB(255, 192, 0): over = over + 1
+                        If toIt > gMaxMx Then
+                            ws.Range("G" & r & ":H" & r).Interior.Color = RGB(255, 0, 0): sapLim = sapLim + 1
+                        ElseIf toIt > mxCap Then
+                            ws.Range("G" & r & ":H" & r).Interior.Color = RGB(255, 192, 0): over = over + 1
+                        End If
                     End If
                     filled = filled + 1
                 Else
@@ -875,15 +1030,27 @@ Public Sub Fill_PO_Numbers()
                 End If
                 ' --- 22 code (extruder) PO ---
                 ws.Range("J" & r & ":L" & r).Interior.ColorIndex = xlNone
+                n = 0
+                If NumOf(ws.Cells(r, "BC").Value) > 0 Then n = CLng(NumOf(ws.Cells(r, "BD").Value) - NumOf(ws.Cells(r, "BC").Value) + 1)
+                If n = 0 And prevCode = c22 And prevEx <> "" Then
+                    exPO = prevEx: exCap = prevExCap       ' shift-split row without own EX batches: same PO as row above
+                Else
+                    nn = n: If nn < 1 Then nn = 1
+                    exPO = PickPO(m, c22, False, nn, exCap, fits)
+                End If
                 If exPO <> "" Then
                     ws.Range("J" & r).Value = CDbl(exPO)
-                    n = CLng(NumOf(ws.Cells(r, "BD").Value) - NumOf(ws.Cells(r, "BC").Value) + 1)
-                    If NumOf(ws.Cells(r, "BC").Value) > 0 And n > 0 Then
+                    If n > 0 Then
                         TakeIterations exPO, n, fromIt, toIt, "MX0" & m
                         ws.Range("K" & r).Value = fromIt
                         ws.Range("L" & r).Value = toIt
-                        If exQty > 0 And toIt > exQty Then ws.Range("K" & r & ":L" & r).Interior.Color = RGB(255, 192, 0): over = over + 1
+                        If toIt > gMaxEx Then
+                            ws.Range("K" & r & ":L" & r).Interior.Color = RGB(255, 0, 0): sapLim = sapLim + 1
+                        ElseIf toIt > exCap Then
+                            ws.Range("K" & r & ":L" & r).Interior.Color = RGB(255, 192, 0): over = over + 1
+                        End If
                     End If
+                    prevCode = c22: prevEx = exPO: prevExCap = exCap
                     filled = filled + 1
                 Else
                     ws.Range("J" & r).Interior.Color = RGB(255, 199, 206): missing = missing + 1
@@ -905,10 +1072,61 @@ Public Sub Fill_PO_Numbers()
     WriteTodayIterations
     Application.ScreenUpdating = True
     MsgBox filled & " PO cells filled." & _
-           IIf(missing > 0, vbLf & missing & " PO(s) not found (pink). Enter them in the PO / clean-out sheets and run again.", "") & _
-           IIf(over > 0, vbLf & over & " row(s) need more batches than the PO has (orange). Release more or adjust.", ""), _
-           IIf(missing + over > 0, vbExclamation, vbInformation)
+           IIf(missing > 0, vbLf & missing & " PO(s) not found (pink). Release them as per 'PO Release List', enter in the PO sheets and run again.", "") & _
+           IIf(over > 0, vbLf & over & " row(s) need more batches than the PO has (orange).", "") & _
+           IIf(sapLim > 0, vbLf & sapLim & " row(s) go beyond the SAP iteration limit (RED) - release an extra PO.", ""), _
+           IIf(missing + over + sapLim > 0, vbExclamation, vbInformation)
 End Sub
+
+' first released PO (oldest first) for this 22 code with room for n more iterations.
+' room = PO qty (or the SAP limit if qty unknown) - iterations already used (log + earlier rows today).
+' Only POs released from 7 days before week start, or already running in the Iteration Log, are used.
+Private Function PickPO(m As Long, c22 As String, isMX As Boolean, n As Long, ByRef cap As Long, ByRef fits As Boolean) As String
+    Dim ws As Worksheet, r As Long, firstRow As Long, colPO As Long, colQty As Long, lastR As Long
+    Dim po As String, q As Long, used As Long, lim As Long, fromD As Double
+    Dim partPO As String, partCap As Long, seen As String
+    Select Case m
+        Case 1: Set ws = ThisWorkbook.Worksheets("MX01 PO"): firstRow = 2: colPO = 8
+        Case 2: Set ws = ThisWorkbook.Worksheets("MX02 PO "): firstRow = 2: colPO = 8
+        Case 3: Set ws = ThisWorkbook.Worksheets("MX03 PO"): firstRow = 3: colPO = 9
+    End Select
+    If isMX Then
+        colQty = colPO + 1: lim = gMaxMx
+    Else
+        colPO = 4: colQty = 5: lim = gMaxEx
+    End If
+    fromD = NumOf(Cfg(S_WEEKSTART)) - 7
+    fits = False: cap = 0
+    lastR = ws.Cells(ws.Rows.Count, 2).End(xlUp).Row
+    For r = firstRow To lastR
+        If CodeStr(ws.Cells(r, 2).Value) = c22 Then
+            po = CodeStr(ws.Cells(r, colPO).Value)
+            If po <> "" And InStr(seen, "|" & po & "|") = 0 Then
+                seen = seen & "|" & po & "|"
+                used = UsedNow(po)
+                If NumOf(ws.Cells(r, 1).Value2) >= fromD Or used > 0 Then
+                    q = CLng(NumOf(ws.Cells(r, colQty).Value))
+                    If q <= 0 Or q > lim Then q = lim
+                    If used + n <= q Then
+                        PickPO = po: cap = q: fits = True: Exit Function
+                    ElseIf used < q And partPO = "" Then
+                        partPO = po: partCap = q
+                    End If
+                End If
+            End If
+        End If
+    Next r
+    If partPO <> "" Then PickPO = partPO: cap = partCap
+End Function
+
+' iterations of a PO already used: earlier rows in this Fill run, else Iteration Log
+Private Function UsedNow(po As String) As Long
+    Dim i As Long
+    For i = 1 To nCur
+        If curPO(i) = po Then UsedNow = curIt(i): Exit Function
+    Next i
+    UsedNow = LastIteration(po)
+End Function
 
 ' running "last iteration" per PO during one Fill run (starts from Iteration Log)
 Private Sub TakeIterations(po As String, n As Long, ByRef fromIt As Long, ByRef toIt As Long, mixer As String)
@@ -948,36 +1166,6 @@ Private Sub ClearTodayIterations()
     Set ws = ThisWorkbook.Worksheets(SH_ITER)
     lastR = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
     If lastR >= 2 Then ws.Range(ws.Cells(2, IL_TFROM), ws.Cells(lastR, IL_TTO)).ClearContents
-End Sub
-
-' latest PO lines for a 22 code in the mixer's PO sheet
-Private Sub FindPO(m As Long, c22 As String, ByRef mxPO As String, ByRef mxQty As Long, _
-                   ByRef exPO As String, ByRef exQty As Long)
-    ' latest OPEN PO for the 22 code: released batches > last iteration already used
-    Dim ws As Worksheet, r As Long, firstRow As Long, colMX As Long, lastR As Long
-    Dim po As String, q As Long
-    mxPO = "": exPO = "": mxQty = 0: exQty = 0
-    Select Case m
-        Case 1: Set ws = ThisWorkbook.Worksheets("MX01 PO"): firstRow = 2: colMX = 8
-        Case 2: Set ws = ThisWorkbook.Worksheets("MX02 PO "): firstRow = 2: colMX = 8
-        Case 3: Set ws = ThisWorkbook.Worksheets("MX03 PO"): firstRow = 3: colMX = 9
-    End Select
-    lastR = ws.Cells(ws.Rows.Count, 2).End(xlUp).Row
-    For r = lastR To firstRow Step -1
-        If CodeStr(ws.Cells(r, 2).Value) = c22 Then
-            po = CodeStr(ws.Cells(r, colMX).Value)
-            If mxPO = "" And po <> "" Then
-                q = CLng(NumOf(ws.Cells(r, colMX + 1).Value))
-                If q = 0 Or LastIteration(po) < q Then mxPO = po: mxQty = q
-            End If
-            po = CodeStr(ws.Cells(r, 4).Value)
-            If exPO = "" And po <> "" Then
-                q = CLng(NumOf(ws.Cells(r, 5).Value))
-                If q = 0 Or LastIteration(po) < q Then exPO = po: exQty = q
-            End If
-            If mxPO <> "" And exPO <> "" Then Exit For
-        End If
-    Next r
 End Sub
 
 ' latest clean-out order (New or Reuse) for a 29 code on this mixer
