@@ -75,6 +75,52 @@ the workbook's own `Raw Data`.
 
 **Thursday:** update STOCK D/H/K from the planning email image and set *Week start date* in Planner Settings.
 
+## Version 2 additions
+
+### 1. Change the plan quantity (Priority sheet)
+| Column | What to do |
+|---|---|
+| **W – MANUAL plan EX batches** | Leave blank to use the planner's quantity (column N). Type a number to override it, or **0** to leave the compound out today. You can also type a number for a compound with status OK to add it. |
+| **X – Reason** | For example: RM shortage, tote shortage, pallet shortage. It is copied into the Remark column (V). |
+| **Y – FINAL plan EX batches** | What the plan actually uses: W if filled, otherwise N. |
+
+After editing, press **Build Mixer Plan** again. Mixer batches are recalculated from the new quantity.
+
+### 2. Mixer availability (Planner Settings, table E2:H9)
+For each weekday and mixer, choose **3 / 2 / 1** (shifts running) or **OFF** from the drop-down.
+* Running only MX01 + MX02 this week: set MX03 to OFF on every day.
+* A limited plan on Sunday: set MX01 to 1 and the others to OFF.
+
+The plan uses the row for the weekday of the **Plan date**. An OFF mixer gets no compounds, and its sheet shows
+"MIXER OFF today". With 1 or 2 shifts, the plan fills shift A (then B) only.
+
+### 3. Limited Batch Log (new sheet)
+On Thursday, after typing the weekly plan into STOCK, set **Week start date** and **Week number** in
+Planner Settings and press **Thursday: Start New Week**. Every compound with a number (not CONT) in STOCK column K is copied in:
+
+22 Code · Material · Compound · Week number · Planned batches (start of week) · Batches produced till date ·
+Remaining batches for the week · Status · Week start date · Batches released in POs
+
+* **Produced till date** = extruder (22 code) iterations closed in the Iteration Log for POs released that week.
+  It updates every time you press Close Day.
+* **Status**: IN PROGRESS → ALL RELEASED (yellow) → **PLAN FINISHED** (whole row turns green).
+* On the STOCK sheet, the compound cell (column F) also turns green when that compound's weekly limit is finished.
+* The planned quantity is fixed when the row is written. If the planning team revises it mid-week, edit column E by hand.
+* Each week adds new rows, so the sheet keeps the history.
+
+### 4. Iteration Log (new layout; the old one is converted automatically)
+PO number · PO type (22 / 21 / 29 code) · Code · Material · Mixer · Released on · Batches released (PO qty) ·
+Last iteration closed (till yesterday) · Today's plan: from · to · **Last iteration used** · Remaining batches · Status
+
+* POs are added **automatically** when you press **Fill PO Numbers** (or **Update Iteration Log**, or Close Day).
+  It reads MX01 PO / MX02 PO / MX03 PO and the three clean-out sheets, from 7 days before the week start.
+* **Fill PO Numbers** writes today's iteration range for each PO. **Close Day** moves it into "Last iteration closed".
+* Status: NOT STARTED / RUNNING / COMPLETED / OVER PO QTY (red).
+* Clean-out (29 code) orders now get iterations too, one per clean-out row (for example, 1–4 for the first line clearance).
+
+All four additions were tested end to end in LibreOffice on a copy of your workbook. The Python dry-run still
+covers only the core planning rules (no manual quantities or mixer availability).
+
 ## Tested
 
 * The VBA was executed end to end (Setup → Build → Fill PO → Tote → Close Day) on a copy of the real workbook.

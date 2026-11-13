@@ -14,6 +14,11 @@ Attribute VB_Name = "MixerPlanner"
 '    5. Build_Tote_Requirement - fills "Tote Requirment" from the plan
 '    6. Close_Day              - remembers last iteration used per PO
 '
+'  Weekly: Start_New_Week     - snapshots limited-qty compounds into
+'                                "Limited Batch Log" (planned / produced / remaining)
+'  Mixer availability per weekday (3/2/1 shifts or OFF) is set in Planner Settings.
+'  Priority column W lets you change the planned EX batches (0 = do not plan).
+'
 '  Weekly (Thursday): type the planning-team image into STOCK columns D, H, K
 '  (K = CONT or the full weekly batch number) and set the week start date in
 '  "Planner Settings".  Released POs are deducted automatically.
@@ -30,6 +35,7 @@ Private Const SH_COMAP As String = "CO Map"
 Private Const SH_ITER As String = "Iteration Log"
 Private Const SH_TOTE As String = "Tote Requirment"
 Private Const SH_PANEL As String = "Control Panel"
+Private Const SH_LIMLOG As String = "Limited Batch Log"
 
 '---- layout constants ---------------------------------------------------------
 Private Const PRI_FIRST As Long = 2          ' Priority row r mirrors STOCK row r
@@ -57,8 +63,17 @@ Private Const S_CYC1 As Long = 15            ' 16 = MX02, 17 = MX03
 Private Const S_DEFCO As Long = 18
 Private Const S_MAXCOMP As Long = 19
 Private Const S_LAST1 As Long = 20           ' 21 = MX02, 22 = MX03
+Private Const S_WEEKNO As Long = 23
+' mixer availability table on Planner Settings: E2 header, rows 3..9 = Monday..Sunday, F/G/H = MX01/MX02/MX03
+Private Const AV_FIRST As Long = 3
+Private Const AV_COL As Long = 6
 
-Private curPO(1 To 500) As String, curIt(1 To 500) As Long, nCur As Long
+' Iteration Log columns
+Private Const IL_PO As Long = 1, IL_TYPE As Long = 2, IL_CODE As Long = 3, IL_MAT As Long = 4, IL_MIX As Long = 5
+Private Const IL_DATE As Long = 6, IL_QTY As Long = 7, IL_CLOSED As Long = 8, IL_TFROM As Long = 9, IL_TTO As Long = 10
+Private Const IL_LAST As Long = 11, IL_REM As Long = 12, IL_STAT As Long = 13, IL_UPD As Long = 14
+
+Private curPO(1 To 500) As String, curIt(1 To 500) As Long, curBase(1 To 500) As Long, curMix(1 To 500) As String, nCur As Long
 
 Private Type PItem
     priRow As Long
@@ -71,6 +86,7 @@ Private Type PItem
     pallet As Double
     wt(1 To 3) As Double
     override As Long
+    manual As Boolean
     mixer As Long
     mxB As Long
     remark As String
@@ -92,6 +108,7 @@ Public Sub Setup_Planner()
     BuildPrioritySheet
     BuildCOMapSheet
     BuildIterationSheet
+    BuildLimitedLogSheet
     BuildControlPanel
     Application.ScreenUpdating = True
     MsgBox "Planner sheets are ready." & vbLf & vbLf & _
@@ -151,6 +168,32 @@ Private Sub BuildSettingsSheet()
     SetRow ws, S_LAST1, "MX01 compound (21 code) running at end of yesterday", "", "If today's first compound is the same, no LC at start"
     SetRow ws, S_LAST1 + 1, "MX02 compound (21 code) running at end of yesterday", "", ""
     SetRow ws, S_LAST1 + 2, "MX03 compound (21 code) running at end of yesterday", "", ""
+    SetRow ws, S_WEEKNO, "Week number (as per planning team)", DatePart("ww", thu, vbMonday, vbFirstFourDays), "Written into 'Limited Batch Log' by Start New Week"
+    ' --- mixer availability per weekday ---
+    Dim d As Long, m As Long
+    ws.Range("E2").Value = "MIXER AVAILABILITY (shifts: 3 / 2 / 1 / OFF)"
+    ws.Range("F2:H2").Value = Array("MX01", "MX02", "MX03")
+    ws.Range("E2:H2").Font.Bold = True
+    For d = 0 To 6
+        ws.Cells(AV_FIRST + d, 5).Value = Format(DateSerial(2024, 1, 1) + d, "dddd")   ' 1-Jan-2024 = Monday
+        For m = 0 To 2
+            With ws.Cells(AV_FIRST + d, AV_COL + m)
+                If IsEmpty(.Value) Then .Value = 3
+                .Interior.Color = RGB(255, 255, 0)
+                .Font.Color = RGB(0, 0, 255)
+                .HorizontalAlignment = xlCenter
+            End With
+        Next m
+    Next d
+    ws.Range("E10").Value = "Example: run only MX01 + MX02 this week -> put OFF for MX03 every day. Sunday limited plan -> 1 for MX01, OFF for others."
+    On Error Resume Next             ' drop-down list is a convenience only
+    With ws.Range(ws.Cells(AV_FIRST, AV_COL), ws.Cells(AV_FIRST + 6, AV_COL + 2)).Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:="3,2,1,OFF"
+    End With
+    On Error GoTo 0
+    ws.Columns("E").ColumnWidth = 44
+    ws.Columns("F:H").ColumnWidth = 9
     ws.Range("B" & S_PLANDATE & ":B" & S_WEEKSTART).NumberFormat = "dd-mmm-yyyy"
     ws.Range("B" & S_DEFCO).NumberFormat = "@"
     ws.Range("B" & S_LAST1 & ":B" & S_LAST1 + 2).NumberFormat = "@"
@@ -164,11 +207,13 @@ Private Sub BuildPrioritySheet()
     Dim ws As Worksheet, r As Long, s As String, sp As String
     Set ws = GetOrAddSheet(SH_PRI, SH_STOCK)
     sp = "'" & SH_SET & "'!$B$"
-    ws.Range("A1:V1").Value = Array("Rank", "22 Code", "Material", "21 Code", "Compound", "Colour", _
+    ws.Range("A1:Y1").Value = Array("Rank", "22 Code", "Material", "21 Code", "Compound", "Colour", _
         "Stock (EX batches)", "EX batches req / day", "Days cover", "Weekly limit (STOCK K)", _
         "Released this week", "Limit left", "Status", "Plan EX batches", "Pallet kg", _
         "MX01 batch wt", "MX02 batch wt", "MX03 batch wt", "Mixer override (type MX01/MX02/MX03)", _
-        "Assigned mixer", "Mixer batches", "Remark")
+        "Assigned mixer", "Mixer batches", "Remark", _
+        "MANUAL plan EX batches (blank = auto, 0 = do not plan)", "Reason for change (RM / tote / pallet shortage...)", _
+        "FINAL plan EX batches")
     For r = PRI_FIRST To PRI_LAST
         s = CStr(r)
         ws.Range("B" & s).Formula = "=IF(TRIM(STOCK!D" & s & "&"""")="""","""",STOCK!D" & s & ")"
@@ -192,20 +237,25 @@ Private Sub BuildPrioritySheet()
         ws.Range("P" & s).Formula = WtFormula(s, "B", "G", "H")
         ws.Range("Q" & s).Formula = WtFormula(s, "L", "Q", "Q")
         ws.Range("R" & s).Formula = WtFormula(s, "U", "Z", "Z")
-        ws.Range("A" & s).Formula = "=IF(N(N" & s & ")>0,COUNTIFS($N$2:$N$61,"">0"",$I$2:$I$61,""<""&I" & s & ")" & _
-            "+COUNTIFS($N$2:$N$61,"">0"",$I$2:$I$61,I" & s & ",$H$2:$H$61,"">""&H" & s & ")+1,"""")"
+        ws.Range("Y" & s).Formula = "=IF(B" & s & "="""","""",IF(TRIM(W" & s & "&"""")="""",N(N" & s & "),IFERROR(MAX(0,ROUNDDOWN(VALUE(W" & s & "&""""),0)),N(N" & s & "))))"
+        ws.Range("A" & s).Formula = "=IF(N(Y" & s & ")>0,COUNTIFS($Y$2:$Y$61,"">0"",$I$2:$I$61,""<""&I" & s & ")" & _
+            "+COUNTIFS($Y$2:$Y$61,"">0"",$I$2:$I$61,I" & s & ",$H$2:$H$61,"">""&H" & s & ")+1,"""")"
     Next r
     ws.Range("I2:I61").NumberFormat = "0.00"
     ws.Range("O2:R61").NumberFormat = "0.0"
     ws.Range("S2:S61").Interior.Color = RGB(255, 255, 0)
-    With ws.Range("A1:V1")
+    ws.Range("W2:X61").Interior.Color = RGB(255, 255, 0)
+    ws.Range("W2:W61").Font.Color = RGB(0, 0, 255)
+    ws.Range("Y2:Y61").Font.Bold = True
+    With ws.Range("A1:Y1")
         .Font.Bold = True: .Font.Color = RGB(255, 255, 255)
         .Interior.Color = RGB(31, 78, 120): .WrapText = True
     End With
     ws.Rows(1).RowHeight = 45
     ws.Cells.Font.Name = "Arial"
-    ws.Columns("A:V").ColumnWidth = 11
+    ws.Columns("A:Y").ColumnWidth = 11
     ws.Columns("C").ColumnWidth = 22: ws.Columns("V").ColumnWidth = 40
+    ws.Columns("W").ColumnWidth = 18: ws.Columns("X").ColumnWidth = 34
     ' status colours
     Dim rng As Range
     Set rng = ws.Range("M2:M61")
@@ -220,7 +270,11 @@ Private Sub BuildPrioritySheet()
     ws.Range("A2").Select
     ActiveWindow.FreezePanes = False
     ActiveWindow.FreezePanes = True
-    If ws.AutoFilterMode = False Then ws.Range("A1:V61").AutoFilter
+    If ws.AutoFilterMode Then ws.AutoFilterMode = False
+    ws.Range("A1:Y61").AutoFilter
+    ' STOCK: compound turns green when its weekly limited quantity is finished
+    Set rng = ThisWorkbook.Worksheets(SH_STOCK).Range("F2:F61")
+    rng.FormatConditions.Add(Type:=xlExpression, Formula1:="=Priority!$M2=""LIMIT DONE""").Interior.Color = RGB(146, 208, 80)
     On Error GoTo 0
 End Sub
 
@@ -272,12 +326,134 @@ Private Sub BuildCOMapSheet()
 End Sub
 
 Private Sub BuildIterationSheet()
-    Dim ws As Worksheet
+    Dim ws As Worksheet, r As Long, lastR As Long, n As Long, i As Long
+    Dim oldPO() As String, oldIt() As Double, oldUpd() As Variant, oldSrc() As String
     Set ws = GetOrAddSheet(SH_ITER, SH_SET)
-    ws.Range("A1:D1").Value = Array("PO number", "Last iteration used", "Updated on", "Source sheet")
-    ws.Range("A1:D1").Font.Bold = True
-    ws.Columns("A:D").ColumnWidth = 20
+    ' migrate the first version (A=PO, B=Last iteration, C=Updated, D=Sheet)
+    If CStr(ws.Range("B1").Value) = "Last iteration used" Then
+        lastR = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+        If lastR >= 2 Then
+            ReDim oldPO(2 To lastR): ReDim oldIt(2 To lastR): ReDim oldUpd(2 To lastR): ReDim oldSrc(2 To lastR)
+            For r = 2 To lastR
+                oldPO(r) = CodeStr(ws.Cells(r, 1).Value): oldIt(r) = NumOf(ws.Cells(r, 2).Value)
+                oldUpd(r) = ws.Cells(r, 3).Value: oldSrc(r) = CStr(ws.Cells(r, 4).Value)
+            Next r
+        End If
+        ws.Cells.Clear
+        If lastR >= 2 Then
+            For r = 2 To lastR
+                If oldPO(r) <> "" Then
+                    ws.Cells(r, IL_PO).NumberFormat = "@": ws.Cells(r, IL_PO).Value = oldPO(r)
+                    ws.Cells(r, IL_MIX).Value = oldSrc(r)
+                    ws.Cells(r, IL_CLOSED).Value = oldIt(r)
+                    ws.Cells(r, IL_UPD).Value = oldUpd(r)
+                    LogRowFormulas ws, r
+                End If
+            Next r
+        End If
+    End If
+    ws.Range("A1:N1").Value = Array("PO number", "PO type", "Code (22 / 21 / 29)", "Material", "Mixer", _
+        "Released on", "Batches released (PO qty)", "Last iteration closed (till yesterday)", _
+        "Today's plan: iteration from", "Today's plan: iteration to", "Last iteration used", _
+        "Remaining batches", "Status", "Updated on")
+    With ws.Range("A1:N1")
+        .Font.Bold = True: .WrapText = True
+        .Font.Color = RGB(255, 255, 255): .Interior.Color = RGB(31, 78, 120)
+    End With
+    ws.Rows(1).RowHeight = 45
+    ws.Columns("A:N").ColumnWidth = 14
+    ws.Columns("D").ColumnWidth = 24
+    ws.Columns("F").NumberFormat = "dd-mmm-yy"
+    ws.Columns("N").NumberFormat = "dd-mmm-yy hh:mm"
     ws.Cells.Font.Name = "Arial"
+    On Error Resume Next
+    ws.Range("M2:M2000").FormatConditions.Delete
+    AddCF ws.Range("M2:M2000"), "COMPLETED", RGB(198, 239, 206)
+    AddCF ws.Range("M2:M2000"), "RUNNING", RGB(255, 230, 153)
+    AddCF ws.Range("M2:M2000"), "OVER PO QTY", RGB(255, 199, 206)
+    On Error GoTo 0
+End Sub
+
+Private Sub LogRowFormulas(ws As Worksheet, r As Long)
+    Dim s As String
+    s = CStr(r)
+    ws.Cells(r, IL_LAST).Formula = "=IF(A" & s & "="""","""",MAX(N(H" & s & "),N(J" & s & ")))"
+    ws.Cells(r, IL_REM).Formula = "=IF(N(G" & s & ")=0,"""",G" & s & "-K" & s & ")"
+    ws.Cells(r, IL_STAT).Formula = "=IF(A" & s & "="""","""",IF(N(G" & s & ")=0,"""",IF(K" & s & ">G" & s & ",""OVER PO QTY""," & _
+        "IF(K" & s & "=G" & s & ",""COMPLETED"",IF(K" & s & ">0,""RUNNING"",""NOT STARTED"")))))"
+End Sub
+
+'==============================================================================
+'  LIMITED BATCH LOG  (weekly limited-quantity compounds)
+'==============================================================================
+Private Sub BuildLimitedLogSheet()
+    Dim ws As Worksheet
+    Set ws = GetOrAddSheet(SH_LIMLOG, SH_PRI)
+    ws.Range("A1:J1").Value = Array("22 Code", "Material", "Compound", "Week number", _
+        "Planned batches (start of week)", "Batches produced till date", "Remaining batches for the week", _
+        "Status", "Week start date", "Batches released in POs (this week)")
+    With ws.Range("A1:J1")
+        .Font.Bold = True: .WrapText = True
+        .Font.Color = RGB(255, 255, 255): .Interior.Color = RGB(31, 78, 120)
+    End With
+    ws.Rows(1).RowHeight = 45
+    ws.Columns("A:J").ColumnWidth = 13
+    ws.Columns("B").ColumnWidth = 24
+    ws.Columns("I").NumberFormat = "dd-mmm-yy"
+    ws.Cells.Font.Name = "Arial"
+    On Error Resume Next
+    ws.Range("A2:J1000").FormatConditions.Delete
+    ws.Range("A2:J1000").FormatConditions.Add(Type:=xlExpression, Formula1:="=$H2=""PLAN FINISHED""").Interior.Color = RGB(146, 208, 80)
+    ws.Range("A2:J1000").FormatConditions.Add(Type:=xlExpression, Formula1:="=$H2=""ALL RELEASED""").Interior.Color = RGB(255, 230, 153)
+    On Error GoTo 0
+End Sub
+
+' Thursday: copy every limited-quantity compound (number in STOCK col K) into the log
+Public Sub Start_New_Week()
+    Dim ws As Worksheet, st As Worksheet, r As Long, k As Variant, c22 As String, wk As Long
+    Dim ws0 As Date, out As Long, found As Long, i As Long, added As Long, s As String, lastR As Long
+    If Not SheetExists(SH_LIMLOG) Then BuildLimitedLogSheet
+    Set ws = ThisWorkbook.Worksheets(SH_LIMLOG)
+    Set st = ThisWorkbook.Worksheets(SH_STOCK)
+    wk = CLng(GetNum(S_WEEKNO))
+    ws0 = CDate(Cfg(S_WEEKSTART))
+    For r = 2 To 61
+        c22 = CodeStr(st.Cells(r, "D").Value)
+        k = st.Cells(r, "K").Value
+        If c22 <> "" And Not IsError(k) Then
+            If UCase(Trim(CStr(k))) <> "CONT" And IsNumeric(k) And Trim(CStr(k)) <> "" Then
+                If CDbl(k) > 0 Then
+                    found = 0
+                    lastR = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+                    For i = 2 To lastR
+                        If CodeStr(ws.Cells(i, 1).Value) = c22 And NumOf(ws.Cells(i, 4).Value) = wk Then found = i: Exit For
+                    Next i
+                    If found = 0 Then        ' planned qty is frozen once written; edit E by hand if the plan is revised
+                        out = lastR + 1
+                        If out < 2 Then out = 2
+                        s = CStr(out)
+                        ws.Range("A" & s).Value = CDbl(c22)
+                        ws.Range("B" & s).Value = st.Cells(r, "E").Value
+                        ws.Range("C" & s).Value = st.Cells(r, "F").Value
+                        ws.Range("D" & s).Value = wk
+                        ws.Range("E" & s).Value = CDbl(k)
+                        ws.Range("I" & s).Value = ws0
+                        ' produced = extrusion iterations closed in Iteration Log for 22-code POs released this week
+                        ws.Range("F" & s).Formula = "=SUMIFS('" & SH_ITER & "'!$H:$H,'" & SH_ITER & "'!$C:$C,A" & s & _
+                            ",'" & SH_ITER & "'!$B:$B,""22 code (extruder)"",'" & SH_ITER & "'!$F:$F,"">=""&I" & s & _
+                            ",'" & SH_ITER & "'!$F:$F,""<""&(I" & s & "+7))"
+                        ws.Range("G" & s).Formula = "=MAX(0,E" & s & "-F" & s & ")"
+                        ws.Range("H" & s).Formula = "=IF(F" & s & ">=E" & s & ",""PLAN FINISHED"",IF(J" & s & ">=E" & s & ",""ALL RELEASED"",""IN PROGRESS""))"
+                        ws.Range("J" & s).Formula = "=SUMIFS('MX01 PO'!$E:$E,'MX01 PO'!$B:$B,A" & s & ",'MX01 PO'!$A:$A,"">=""&I" & s & ",'MX01 PO'!$A:$A,""<""&(I" & s & "+7))" & _
+                            "+SUMIFS('MX02 PO '!$E:$E,'MX02 PO '!$B:$B,A" & s & ",'MX02 PO '!$A:$A,"">=""&I" & s & ",'MX02 PO '!$A:$A,""<""&(I" & s & "+7))" & _
+                            "+SUMIFS('MX03 PO'!$E:$E,'MX03 PO'!$B:$B,A" & s & ",'MX03 PO'!$A:$A,"">=""&I" & s & ",'MX03 PO'!$A:$A,""<""&(I" & s & "+7))"
+                        added = added + 1
+                    End If
+                End If
+            End If
+        End If
+    Next r
+    MsgBox added & " limited compound(s) added to '" & SH_LIMLOG & "' for week " & wk & ".", vbInformation
 End Sub
 
 Private Sub BuildControlPanel()
@@ -290,22 +466,27 @@ Private Sub BuildControlPanel()
     On Error GoTo 0
     ws.Range("B2").Value = "MIXER COMPOUND PLANNER - daily steps"
     ws.Range("B2").Font.Size = 16: ws.Range("B2").Font.Bold = True
-    caps = Array("1. Build Mixer Plan", "2. Fill PO Numbers", "3. Build Tote Requirement", "4. Close Day (log iterations)", "Re-run Setup")
-    macs = Array("Build_Mixer_Plan", "Fill_PO_Numbers", "Build_Tote_Requirement", "Close_Day", "Setup_Planner")
+    caps = Array("1. Build Mixer Plan", "2. Fill PO Numbers", "3. Build Tote Requirement", "4. Close Day (log iterations)", _
+                 "Thursday: Start New Week", "Update Iteration Log", "Re-run Setup")
+    macs = Array("Build_Mixer_Plan", "Fill_PO_Numbers", "Build_Tote_Requirement", "Close_Day", _
+                 "Start_New_Week", "Update_Iteration_Log", "Setup_Planner")
     notes = Array("After pasting LX02 (and on Thursday after updating STOCK H/K from the weekly plan). Writes MX01/MX02/MX03.", _
                   "After releasing POs in SAP and typing them in MX01 PO / MX02 PO / MX03 PO and the clean-out sheets.", _
                   "Fills 'Tote Requirment' from today's plan.", _
                   "At end of the day - stores the last iteration of every PO so tomorrow continues from there.", _
+                  "After typing the weekly plan into STOCK (D/H/K), setting week start + week number and mixer availability.", _
+                  "Adds newly released POs (PO sheets + clean-out sheets) to the Iteration Log. Also runs inside Fill PO / Close Day.", _
                   "Only when sheets are missing. Keeps your settings.")
-    For i = 0 To 4
+    For i = 0 To 6
         Set b = ws.Buttons.Add(ws.Range("B" & 4 + i * 3).Left, ws.Range("B" & 4 + i * 3).Top, 220, 30)
         b.Caption = caps(i)
         b.OnAction = macs(i)
         ws.Range("D" & 4 + i * 3).Value = notes(i)
     Next i
-    ws.Range("B20").Value = "Weekly (Thursday): type the planning image into STOCK - column D (22 code), H (Extrusion batch/day), K (CONT or FULL weekly batches)."
-    ws.Range("B21").Value = "Then set 'Week start date' in Planner Settings. Do not reduce column K by hand - released POs are deducted automatically."
-    ws.Range("B22").Value = "Priority sheet: do NOT sort it (rows mirror STOCK). Use the filter on column A (Rank) or M (Status)."
+    ws.Range("B31").Value = "Change a plan quantity: Priority column W (0 = do not plan) + reason in column X, then press 1 again."
+    ws.Range("B28").Value = "Weekly (Thursday): type the planning image into STOCK - column D (22 code), H (Extrusion batch/day), K (CONT or FULL weekly batches)."
+    ws.Range("B29").Value = "Then set 'Week start date' in Planner Settings. Do not reduce column K by hand - released POs are deducted automatically."
+    ws.Range("B30").Value = "Priority sheet: do NOT sort it (rows mirror STOCK). Use the filter on column A (Rank) or M (Status)."
     ws.Columns("B").ColumnWidth = 34
     ws.Cells.Font.Name = "Arial"
 End Sub
@@ -319,7 +500,7 @@ Public Sub Build_Mixer_Plan()
     Dim cyc(1 To 3) As Double, load(1 To 3) As Double, ncomp(1 To 3) As Long
     Dim lastRun(1 To 3) As String
     Dim steps(1 To 3, 1 To 200) As PStep, nSteps(1 To 3) As Long
-    Dim dayMin As Double, lcMin As Double, maxComp As Long
+    Dim dayMin As Double, lcMin As Double, maxComp As Long, dm(1 To 3) As Double, sh(1 To 3) As Long
 
     If Not SheetExists(SH_PRI) Or Not SheetExists(SH_SET) Then
         MsgBox "Run Setup_Planner first.", vbExclamation: Exit Sub
@@ -332,6 +513,9 @@ Public Sub Build_Mixer_Plan()
     For m = 1 To 3
         cyc(m) = GetNum(S_CYC1 + m - 1)
         If cyc(m) <= 0 Then MsgBox "Set the MX0" & m & " cycle time in Planner Settings.", vbExclamation: GoTo done
+        sh(m) = ShiftsAvailable(m, CDate(Cfg(S_PLANDATE)))
+        dm(m) = sh(m) * GetNum(S_SHIFTMIN)
+        If dm(m) > dayMin Then dm(m) = dayMin
         lastRun(m) = CodeStr(Cfg(S_LAST1 + m - 1))
         If lastRun(m) = "" Then lastRun(m) = LastRunning21(m)   ' auto: last compound of yesterday's plan
     Next m
@@ -341,8 +525,8 @@ Public Sub Build_Mixer_Plan()
     n = 0
     wsP.Range("T2:V" & PRI_LAST).ClearContents
     For r = PRI_FIRST To PRI_LAST
-        If IsNumeric(wsP.Cells(r, "N").Value) And CodeStr(wsP.Cells(r, "B").Value) <> "" Then
-            If CDbl(wsP.Cells(r, "N").Value) > 0 Then
+        If IsNumeric(wsP.Cells(r, "Y").Value) And CodeStr(wsP.Cells(r, "B").Value) <> "" Then
+            If CDbl(wsP.Cells(r, "Y").Value) > 0 Then
                 n = n + 1
                 With it(n)
                     .priRow = r
@@ -351,7 +535,8 @@ Public Sub Build_Mixer_Plan()
                     .mat = CStr(wsP.Cells(r, "C").Value)
                     .cover = NumOf(wsP.Cells(r, "I").Value)
                     .req = NumOf(wsP.Cells(r, "H").Value)
-                    .exB = CLng(wsP.Cells(r, "N").Value)
+                    .exB = CLng(wsP.Cells(r, "Y").Value)          ' FINAL plan = manual (col W) or auto (col N)
+                    .manual = (Trim(CStr(wsP.Cells(r, "W").Value)) <> "")
                     .pallet = NumOf(wsP.Cells(r, "O").Value)
                     .wt(1) = NumOf(wsP.Cells(r, "P").Value)
                     .wt(2) = NumOf(wsP.Cells(r, "Q").Value)
@@ -392,7 +577,7 @@ Public Sub Build_Mixer_Plan()
             Next jj
             best = 0: bestKey = 1E+30
             For m = 1 To 3
-                ok = (ovr = 0 Or ovr = m) And ncomp(m) < maxComp
+                ok = (ovr = 0 Or ovr = m) And ncomp(m) < maxComp And dm(m) > 0
                 If ok Then
                     needMin = 0
                     For jj = gi To n
@@ -406,7 +591,7 @@ Public Sub Build_Mixer_Plan()
                 If ok Then
                     lc = LCNeeded(nSteps(m), it(g).code21, lastRun(m), lcMin)
                     key = load(m) + lc + needMin
-                    If key > dayMin Then key = key + 1000000#   ' prefer a mixer where it fits fully
+                    If key > dm(m) Then key = key + 1000000#   ' prefer a mixer where it fits fully
                     If key < bestKey Then bestKey = key: best = m
                 End If
             Next m
@@ -416,13 +601,13 @@ Public Sub Build_Mixer_Plan()
                     j = ord(jj)
                     If it(j).code21 = it(g).code21 Then
                         it(j).done = True
-                        it(j).remark = "Not planned - no eligible mixer (check Recipe Details weights) or compound limit reached"
+                        it(j).remark = "Not planned - no eligible mixer running today (check mixer availability / Recipe Details weights / compound limit)"
                     End If
                 Next jj
             Else
                 m = best
                 lc = LCNeeded(nSteps(m), it(g).code21, lastRun(m), lcMin)
-                If dayMin - load(m) - lc < cyc(m) Then
+                If dm(m) - load(m) - lc < cyc(m) Then
                     For jj = gi To n
                         j = ord(jj)
                         If it(j).code21 = it(g).code21 Then it(j).done = True: it(j).remark = "Not planned - mixer capacity full"
@@ -440,7 +625,7 @@ Public Sub Build_Mixer_Plan()
                         If it(j).code21 = it(g).code21 Then
                             it(j).done = True
                             mxB = MixBatches(it(j).exB, it(j).pallet, it(j).wt(m))
-                            avail = dayMin - load(m)
+                            avail = dm(m) - load(m)
                             If mxB * cyc(m) > avail Then
                                 fitMx = Int(avail / cyc(m))
                                 exFit = Int(fitMx * it(j).wt(m) / it(j).pallet)
@@ -476,7 +661,11 @@ Public Sub Build_Mixer_Plan()
                 wsP.Cells(.priRow, "T").Value = "MX0" & .mixer
                 wsP.Cells(.priRow, "U").Value = .mxB
             End If
-            wsP.Cells(.priRow, "V").Value = .remark
+            If .manual Then
+                wsP.Cells(.priRow, "V").Value = Trim("MANUAL qty" & IIf(Trim(CStr(wsP.Cells(.priRow, "X").Value)) <> "", " (" & wsP.Cells(.priRow, "X").Value & ")", "") & ". " & .remark)
+            Else
+                wsP.Cells(.priRow, "V").Value = .remark
+            End If
         End With
     Next i
 
@@ -484,7 +673,15 @@ Public Sub Build_Mixer_Plan()
     Dim summary As String
     For m = 1 To 3
         WriteMixerSheet m, it, steps, nSteps(m), cyc(m)
-        summary = summary & "MX0" & m & ": " & Format(load(m), "0") & " / " & Format(dayMin, "0") & " min, " & ncomp(m) & " compound(s)" & vbLf
+        If dm(m) <= 0 Then
+            With ThisWorkbook.Worksheets("MX0" & m)
+                .Range("A" & PLAN_FIRST).Value = Cfg(S_PLANDATE)
+                .Range("D" & PLAN_FIRST).Value = "MIXER OFF today (Planner Settings)"
+            End With
+            summary = summary & "MX0" & m & ": OFF" & vbLf
+        Else
+            summary = summary & "MX0" & m & ": " & Format(load(m), "0") & " / " & Format(dm(m), "0") & " min (" & sh(m) & " shift(s)), " & ncomp(m) & " compound(s)" & vbLf
+        End If
     Next m
     Application.ScreenUpdating = True
     MsgBox "Mixer plan built." & vbLf & vbLf & summary & vbLf & _
@@ -520,7 +717,10 @@ Private Sub WriteMixerSheet(m As Long, it() As PItem, steps() As PStep, ns As Lo
     Set ws = ThisWorkbook.Worksheets("MX0" & m)
     ' log yesterday's iterations automatically before clearing an older plan
     If IsDate(ws.Range("A" & PLAN_FIRST).Value) Then
-        If CDate(ws.Range("A" & PLAN_FIRST).Value) < CDate(Cfg(S_PLANDATE)) Then LogIterations ws
+        If CDate(ws.Range("A" & PLAN_FIRST).Value) < CDate(Cfg(S_PLANDATE)) Then
+            LogIterations ws                 ' yesterday's plan -> "last iteration closed"
+            ClearTodayIterations
+        End If
     End If
     ClearPlan ws
 
@@ -648,6 +848,8 @@ Public Sub Fill_PO_Numbers()
     Dim n As Long, fromIt As Long, toIt As Long
     Dim missing As Long, filled As Long, over As Long
     Application.ScreenUpdating = False
+    SyncPOLog                       ' newly released POs -> Iteration Log
+    ClearTodayIterations
     nCur = 0
     For m = 1 To 3
         Set ws = ThisWorkbook.Worksheets("MX0" & m)
@@ -662,7 +864,7 @@ Public Sub Fill_PO_Numbers()
                     ws.Range("F" & r).Value = CDbl(mxPO)
                     n = CLng(NumOf(ws.Cells(r, "BB").Value) - NumOf(ws.Cells(r, "BA").Value) + 1)
                     If NumOf(ws.Cells(r, "BA").Value) > 0 And n > 0 Then
-                        TakeIterations mxPO, n, fromIt, toIt      ' continues PO across rows and days
+                        TakeIterations mxPO, n, fromIt, toIt, "MX0" & m   ' continues PO across rows and days
                         ws.Range("G" & r).Value = fromIt
                         ws.Range("H" & r).Value = toIt
                         If mxQty > 0 And toIt > mxQty Then ws.Range("G" & r & ":H" & r).Interior.Color = RGB(255, 192, 0): over = over + 1
@@ -677,7 +879,7 @@ Public Sub Fill_PO_Numbers()
                     ws.Range("J" & r).Value = CDbl(exPO)
                     n = CLng(NumOf(ws.Cells(r, "BD").Value) - NumOf(ws.Cells(r, "BC").Value) + 1)
                     If NumOf(ws.Cells(r, "BC").Value) > 0 And n > 0 Then
-                        TakeIterations exPO, n, fromIt, toIt
+                        TakeIterations exPO, n, fromIt, toIt, "MX0" & m
                         ws.Range("K" & r).Value = fromIt
                         ws.Range("L" & r).Value = toIt
                         If exQty > 0 And toIt > exQty Then ws.Range("K" & r & ":L" & r).Interior.Color = RGB(255, 192, 0): over = over + 1
@@ -690,6 +892,9 @@ Public Sub Fill_PO_Numbers()
                 coPO = FindCleanoutPO(m, c22)
                 If coPO <> "" Then
                     ws.Range("F" & r).Value = CDbl(coPO): ws.Range("F" & r).Interior.ColorIndex = xlNone
+                    TakeIterations coPO, 1, fromIt, toIt, "MX0" & m     ' each clean-out row uses 1 batch of the order
+                    ws.Range("G" & r).Value = fromIt
+                    ws.Range("H" & r).Value = toIt
                     filled = filled + 1
                 Else
                     ws.Range("F" & r).Interior.Color = RGB(255, 199, 206): missing = missing + 1
@@ -697,6 +902,7 @@ Public Sub Fill_PO_Numbers()
             End If
         Next r
     Next m
+    WriteTodayIterations
     Application.ScreenUpdating = True
     MsgBox filled & " PO cells filled." & _
            IIf(missing > 0, vbLf & missing & " PO(s) not found (pink). Enter them in the PO / clean-out sheets and run again.", "") & _
@@ -705,7 +911,7 @@ Public Sub Fill_PO_Numbers()
 End Sub
 
 ' running "last iteration" per PO during one Fill run (starts from Iteration Log)
-Private Sub TakeIterations(po As String, n As Long, ByRef fromIt As Long, ByRef toIt As Long)
+Private Sub TakeIterations(po As String, n As Long, ByRef fromIt As Long, ByRef toIt As Long, mixer As String)
     Dim i As Long
     For i = 1 To nCur
         If curPO(i) = po Then Exit For
@@ -714,10 +920,34 @@ Private Sub TakeIterations(po As String, n As Long, ByRef fromIt As Long, ByRef 
         nCur = nCur + 1: i = nCur
         curPO(i) = po
         curIt(i) = LastIteration(po)
+        curBase(i) = curIt(i)
+        curMix(i) = mixer
     End If
     fromIt = curIt(i) + 1
     toIt = curIt(i) + n
     curIt(i) = toIt
+End Sub
+
+' write today's planned iteration range per PO into the Iteration Log
+Private Sub WriteTodayIterations()
+    Dim ws As Worksheet, i As Long, r As Long
+    Set ws = ThisWorkbook.Worksheets(SH_ITER)
+    For i = 1 To nCur
+        If curIt(i) > curBase(i) Then
+            r = EnsureLogRow(curPO(i))
+            ws.Cells(r, IL_TFROM).Value = curBase(i) + 1
+            ws.Cells(r, IL_TTO).Value = curIt(i)
+            If Trim(CStr(ws.Cells(r, IL_MIX).Value)) = "" Then ws.Cells(r, IL_MIX).Value = curMix(i)
+            ws.Cells(r, IL_UPD).Value = Now
+        End If
+    Next i
+End Sub
+
+Private Sub ClearTodayIterations()
+    Dim ws As Worksheet, lastR As Long
+    Set ws = ThisWorkbook.Worksheets(SH_ITER)
+    lastR = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lastR >= 2 Then ws.Range(ws.Cells(2, IL_TFROM), ws.Cells(lastR, IL_TTO)).ClearContents
 End Sub
 
 ' latest PO lines for a 22 code in the mixer's PO sheet
@@ -826,9 +1056,11 @@ End Sub
 '==============================================================================
 Public Sub Close_Day()
     Dim m As Long
+    SyncPOLog
     For m = 1 To 3
         LogIterations ThisWorkbook.Worksheets("MX0" & m)
     Next m
+    ClearTodayIterations
     MsgBox "Iterations logged. Tomorrow's plan will continue each PO from its next iteration.", vbInformation
 End Sub
 
@@ -850,24 +1082,100 @@ Private Function LastIteration(po As String) As Long
     If Not SheetExists(SH_ITER) Then Exit Function
     Set ws = ThisWorkbook.Worksheets(SH_ITER)
     Set f = FindPORow(ws, po)
-    If Not f Is Nothing Then LastIteration = CLng(NumOf(ws.Cells(f.Row, 2).Value))
+    If Not f Is Nothing Then LastIteration = CLng(NumOf(ws.Cells(f.Row, IL_CLOSED).Value))
 End Function
 
 Private Sub SetIteration(po As String, lastIt As Long, src As String)
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(SH_ITER)
+    r = EnsureLogRow(po)
+    If Trim(CStr(ws.Cells(r, IL_MIX).Value)) = "" Then ws.Cells(r, IL_MIX).Value = src
+    If NumOf(ws.Cells(r, IL_CLOSED).Value) >= lastIt Then Exit Sub
+    ws.Cells(r, IL_CLOSED).Value = lastIt
+    ws.Cells(r, IL_UPD).Value = Now
+End Sub
+
+' row of a PO in the Iteration Log (added if missing)
+Private Function EnsureLogRow(po As String) As Long
     Dim ws As Worksheet, f As Range, r As Long
+    If Not SheetExists(SH_ITER) Then BuildIterationSheet
     Set ws = ThisWorkbook.Worksheets(SH_ITER)
     Set f = FindPORow(ws, po)
     If f Is Nothing Then
         r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
-        ws.Cells(r, 1).NumberFormat = "@"
-        ws.Cells(r, 1).Value = po
+        If r < 2 Then r = 2
+        ws.Cells(r, IL_PO).NumberFormat = "@"
+        ws.Cells(r, IL_PO).Value = po
+        LogRowFormulas ws, r
     Else
         r = f.Row
-        If NumOf(ws.Cells(r, 2).Value) >= lastIt Then Exit Sub
     End If
-    ws.Cells(r, 2).Value = lastIt
-    ws.Cells(r, 3).Value = Now
-    ws.Cells(r, 4).Value = src
+    EnsureLogRow = r
+End Function
+
+' add / update released POs (PO sheets + clean-out sheets) from 7 days before week start onwards
+Public Sub Update_Iteration_Log()
+    SyncPOLog
+    MsgBox "Iteration Log updated with released POs.", vbInformation
+End Sub
+
+Private Sub SyncPOLog()
+    Dim m As Long, ws As Worksheet, r As Long, lastR As Long, firstRow As Long, colMX As Long
+    Dim fromD As Double, d As Double, k As Long, sets As Variant, q As Double
+    If Not SheetExists(SH_ITER) Then BuildIterationSheet
+    fromD = NumOf(Cfg(S_WEEKSTART)) - 7
+    For m = 1 To 3
+        Select Case m
+            Case 1: Set ws = ThisWorkbook.Worksheets("MX01 PO"): firstRow = 2: colMX = 8
+            Case 2: Set ws = ThisWorkbook.Worksheets("MX02 PO "): firstRow = 2: colMX = 8
+            Case 3: Set ws = ThisWorkbook.Worksheets("MX03 PO"): firstRow = 3: colMX = 9
+        End Select
+        lastR = ws.Cells(ws.Rows.Count, 2).End(xlUp).Row
+        For r = firstRow To lastR
+            d = NumOf(ws.Cells(r, 1).Value2)
+            If d >= fromD Then
+                ' 22 code (extruder) PO: D = order, E = batches
+                PutLog CodeStr(ws.Cells(r, 4).Value), "22 code (extruder)", ws.Cells(r, 2).Value, ws.Cells(r, 3).Value, _
+                       "MX0" & m, d, NumOf(ws.Cells(r, 5).Value)
+                ' 21 code (mixer) PO
+                PutLog CodeStr(ws.Cells(r, colMX).Value), "21 code (mixer)", ws.Cells(r, 7).Value, ws.Cells(r, 3).Value, _
+                       "MX0" & m, d, NumOf(ws.Cells(r, colMX + 1).Value)
+            End If
+        Next r
+        ' clean-out orders: each set = date, code, material, order, batches (0 = none)
+        Select Case m
+            Case 1: Set ws = ThisWorkbook.Worksheets("MX1 Clean out"): sets = Array(Array(1, 2, 3, 4, 5), Array(6, 7, 8, 9, 0))
+            Case 2: Set ws = ThisWorkbook.Worksheets("MX2 Clean out"): sets = Array(Array(1, 2, 3, 4, 5), Array(6, 7, 8, 9, 0))
+            Case 3: Set ws = ThisWorkbook.Worksheets("MX03 Cleanout PO"): sets = Array(Array(1, 2, 3, 5, 6))
+        End Select
+        For k = LBound(sets) To UBound(sets)
+            lastR = ws.Cells(ws.Rows.Count, sets(k)(3)).End(xlUp).Row
+            For r = 3 To lastR
+                d = NumOf(ws.Cells(r, sets(k)(0)).Value2)
+                If d >= fromD Then
+                    q = 0
+                    If sets(k)(4) > 0 Then q = NumOf(ws.Cells(r, sets(k)(4)).Value)
+                    PutLog CodeStr(ws.Cells(r, sets(k)(3)).Value), "29 code (clean-out)", ws.Cells(r, sets(k)(1)).Value, _
+                           ws.Cells(r, sets(k)(2)).Value, "MX0" & m, d, q
+                End If
+            Next r
+        Next k
+    Next m
+End Sub
+
+Private Sub PutLog(po As String, poType As String, code As Variant, mat As Variant, mixer As String, d As Double, qty As Double)
+    Dim ws As Worksheet, r As Long
+    If po = "" Or Not IsNumeric(po) Then Exit Sub
+    Set ws = ThisWorkbook.Worksheets(SH_ITER)
+    r = EnsureLogRow(po)
+    ws.Cells(r, IL_TYPE).Value = poType
+    If CodeStr(code) <> "" And IsNumeric(CodeStr(code)) Then ws.Cells(r, IL_CODE).Value = CDbl(CodeStr(code))
+    If Not IsError(mat) Then
+        If Trim(CStr(mat)) <> "" Then ws.Cells(r, IL_MAT).Value = Trim(CStr(mat))
+    End If
+    ws.Cells(r, IL_MIX).Value = mixer
+    If d > 0 Then ws.Cells(r, IL_DATE).Value = CDate(d)
+    If qty > 0 Then ws.Cells(r, IL_QTY).Value = qty
 End Sub
 
 Private Function FindPORow(ws As Worksheet, po As String) As Range
@@ -911,6 +1219,7 @@ Private Function NumOf(v As Variant) As Double
     ' locale-safe number (Val() breaks on comma-decimal settings)
     If IsError(v) Then Exit Function
     If IsEmpty(v) Then Exit Function
+    If VarType(v) = vbDate Then NumOf = CDbl(v): Exit Function   ' IsNumeric() is False for dates
     If IsNumeric(v) Then NumOf = CDbl(v)
 End Function
 
@@ -931,6 +1240,22 @@ Private Function LastRunning21(m As Long) As String
         c = CodeStr(ws.Range("D" & r).Value)
         If Left(c, 2) = "22" And Len(c) = 8 Then LastRunning21 = Code21Of(c): Exit Function
     Next r
+End Function
+
+' shifts a mixer runs on a date (Planner Settings availability table; blank = 3, OFF = 0)
+Private Function ShiftsAvailable(m As Long, d As Date) As Long
+    Dim v As Variant
+    v = ThisWorkbook.Worksheets(SH_SET).Cells(AV_FIRST + Weekday(d, vbMonday) - 1, AV_COL + m - 1).Value
+    If IsError(v) Then Exit Function
+    If Trim(CStr(v)) = "" Then
+        ShiftsAvailable = 3
+    ElseIf IsNumeric(v) Then
+        ShiftsAvailable = CLng(v)
+        If ShiftsAvailable > 3 Then ShiftsAvailable = 3
+        If ShiftsAvailable < 0 Then ShiftsAvailable = 0
+    Else
+        ShiftsAvailable = 0                ' "OFF" or anything else
+    End If
 End Function
 
 Private Function SheetExists(nm As String) As Boolean
